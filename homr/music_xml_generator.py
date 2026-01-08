@@ -1,3 +1,4 @@
+import bisect
 import math
 from collections import defaultdict
 from fractions import Fraction
@@ -10,6 +11,13 @@ from homr.simple_logging import eprint
 from homr.transformer.vocabulary import EncodedSymbol, empty, nonote, sort_token_chords
 
 
+def _find_child_of_type(node: mxl.XMLElement, child_type: type) -> mxl.XMLElement | None:
+    for child in node.get_children(ordered=False):
+        if isinstance(child, child_type):
+            return child
+    return None
+
+
 class ConversionState:
     def __init__(self, division: int, nominator: Fraction):
         self.beats = 4 * constants.duration_of_quarter
@@ -18,6 +26,12 @@ class ConversionState:
         self.tremolo_state = "stop"
         self.volta_number = 1
         self.last_volta_measure = -10
+        self._open_slurs: dict[tuple[int, int], list[int]] = defaultdict(list)
+        self._available_slur_numbers = list(range(1, 16))
+        self._open_ties: dict[tuple[int, str, str], list[int]] = defaultdict(list)
+        self._available_tie_numbers: dict[tuple[int, str, str], list[int]] = defaultdict(
+            lambda: list(range(1, 7))
+        )
 
     def start_volta(self, measure_no: int) -> int:
         if measure_no == self.last_volta_measure + 1:
@@ -36,6 +50,54 @@ class ConversionState:
         else:
             self.tremolo_state = "start"
         return self.tremolo_state
+
+    def start_slur(self, staff: int, voice: int) -> int:
+        key = (staff, voice)
+        stack = self._open_slurs[key]
+        if len(self._available_slur_numbers) == 0:
+            eprint("Exceeded slur numbering limits; slurs may overlap incorrectly")
+            number = stack[-1] if len(stack) > 0 else 6
+        else:
+            number = self._available_slur_numbers.pop(0)
+        stack.append(number)
+        return number
+
+    def stop_slur(self, staff: int, voice: int) -> int | None:
+        key = (staff, voice)
+        if key not in self._open_slurs or len(self._open_slurs[key]) == 0:
+            return None
+        number = self._open_slurs[key].pop()
+        self._release_slur_number(key, number)
+        return number
+
+    def _release_slur_number(self, key: tuple[int, int], number: int) -> None:
+        if 1 <= number <= 6 and number not in self._available_slur_numbers:
+            bisect.insort(self._available_slur_numbers, number)
+
+    def start_tie(self, staff: int, pitch: str, lift: str) -> int:
+        key = (staff, pitch, lift)
+        available = self._available_tie_numbers[key]
+        stack = self._open_ties[key]
+        if len(available) == 0:
+            eprint("Exceeded tie numbering limits; ties may overlap incorrectly")
+            number = stack[-1] if len(stack) > 0 else 6
+        else:
+            number = available.pop(0)
+        stack.append(number)
+        return number
+
+    def stop_tie(self, staff: int, pitch: str, lift: str) -> int | None:
+        key = (staff, pitch, lift)
+        if key not in self._open_ties or len(self._open_ties[key]) == 0:
+            return None
+        number = self._open_ties[key].pop()
+        self._release_tie_number(key, number)
+        return number
+
+    def _release_tie_number(self, key: tuple[int, str, str], number: int) -> None:
+        available = self._available_tie_numbers[key]
+        if 1 <= number <= 6 and number not in available:
+            bisect.insort(available, number)
 
 
 class SymbolChord:
@@ -81,19 +143,17 @@ class SymbolChord:
             chords = (chords[1], chords[0])
         return [chord for chord in chords if len(chord.symbols) > 0]
 
-    def strip_slur_ties(self) -> tuple[list[str], "SymbolChord"]:
-        slurs_ties = set()
-
+    def strip_slur_ties(self) -> tuple[list[list[str]], "SymbolChord"]:
+        stripped_per_symbol = []
         result = []
         for symbol in self.symbols:
             stripped, result_symbol = symbol.strip_articulations(
                 ["slurStart", "slurStop", "tieStart", "tieStop"]
             )
+            stripped_per_symbol.append(stripped)
             result.append(result_symbol)
-            for articulation in stripped:
-                slurs_ties.add(articulation)
 
-        return sorted(slurs_ties), SymbolChord(result, tuplet_mark=self.tuplet_mark)
+        return stripped_per_symbol, SymbolChord(result, tuplet_mark=self.tuplet_mark)
 
 
 class XmlGeneratorArguments:
@@ -385,7 +445,12 @@ DURATION_NAMES = {
 
 
 def build_articulations(
-    note: mxl.XMLNote, articualations: str, tuplet_mark: str, state: ConversionState
+    note: mxl.XMLNote,
+    articualations: str,
+    tuplet_mark: str,
+    state: ConversionState,
+    staff: int | None = None,
+    voice: int | None = None,
 ) -> None:
     notation = mxl.XMLNotations()
     note.add_child(notation)
@@ -427,13 +492,48 @@ def build_articulations(
         elif articulation == "doit":
             xml_articulations.append(mxl.XMLDoit())
         elif articulation == "slurStart":
-            notation.add_child(mxl.XMLSlur(type="start"))
+            attributes = {"type": "start"}
+            if staff is not None and voice is not None:
+                number = state.start_slur(staff, voice)
+                attributes["number"] = number
+            notation.add_child(mxl.XMLSlur(**attributes))
         elif articulation == "slurStop":
-            notation.add_child(mxl.XMLSlur(type="stop"))
+            attributes = {"type": "stop"}
+            if staff is not None and voice is not None:
+                number = state.stop_slur(staff, voice)
+                if number is not None:
+                    attributes["number"] = number
+            notation.add_child(mxl.XMLSlur(**attributes))
         elif articulation == "tieStart":
-            notation.add_child(mxl.XMLTied(type="start"))
+            attributes = {"type": "start"}
+            if staff is not None and voice is not None:
+                pitch = _find_child_of_type(note, mxl.XMLPitch)
+                if pitch:
+                    step = _find_child_of_type(pitch, mxl.XMLStep)
+                    octave = _find_child_of_type(pitch, mxl.XMLOctave)
+                    if step and octave:
+                        pitch_key = f"{step.value_}{octave.value_}"
+                        alter = _find_child_of_type(pitch, mxl.XMLAlter)
+                        lift = str(alter.value_) if alter else "0"
+                        number = state.start_tie(staff, pitch_key, lift)
+                        attributes["number"] = number
+            notation.add_child(mxl.XMLTied(**attributes))
         elif articulation == "tieStop":
-            notation.add_child(mxl.XMLTied(type="stop"))
+            attributes = {"type": "stop"}
+            if staff is not None and voice is not None:
+                pitch = _find_child_of_type(note, mxl.XMLPitch)
+                if pitch:
+                    step = _find_child_of_type(pitch, mxl.XMLStep)
+                    octave = _find_child_of_type(pitch, mxl.XMLOctave)
+                    if step and octave:
+                        pitch_key = f"{step.value_}{octave.value_}"
+                        alter = _find_child_of_type(pitch, mxl.XMLAlter)
+                        lift = str(alter.value_) if alter else "0"
+                        number = state.stop_tie(staff, pitch_key, lift)
+                        if number is None:
+                            continue
+                        attributes["number"] = number
+            notation.add_child(mxl.XMLTied(**attributes))
         else:
             raise ValueError("Unsupported articulation " + articulation)
 
@@ -495,8 +595,10 @@ def build_note_or_rest(
         note.add_child(mxl.XMLType(value_=duration_name))
         note.add_child(mxl.XMLDuration(value_=state.beats))
 
-    note.add_child(mxl.XMLStaff(value_=get_staff(model_note)))
-    note.add_child(mxl.XMLVoice(value_=(str(voice + 1))))
+    staff_value = get_staff(model_note)
+    note.add_child(mxl.XMLStaff(value_=staff_value))
+    xml_voice = voice + 1
+    note.add_child(mxl.XMLVoice(value_=(str(xml_voice))))
     for _ in range(model_duration.dots):
         note.add_child(mxl.XMLDot())
     if model_duration.actual_notes != model_duration.normal_notes:
@@ -504,9 +606,11 @@ def build_note_or_rest(
         time_modification.add_child(mxl.XMLActualNotes(value_=model_duration.actual_notes))
         time_modification.add_child(mxl.XMLNormalNotes(value_=model_duration.normal_notes))
         note.add_child(time_modification)
-        build_articulations(note, model_note.articulation, tuplet_mark, state)
+        build_articulations(
+            note, model_note.articulation, tuplet_mark, state, staff_value, xml_voice
+        )
     else:
-        build_articulations(note, model_note.articulation, "", state)
+        build_articulations(note, model_note.articulation, "", state, staff_value, xml_voice)
 
     return note
 
@@ -528,7 +632,11 @@ def build_multi_measure_rest(
 def build_note_chord(
     note_chord: SymbolChord, state: ConversionState, chord_duration: Fraction
 ) -> list[mxl.XMLNote]:
-    _slurs_ties, note_chord = note_chord.strip_slur_ties()
+    slur_tie_groups, note_chord = note_chord.strip_slur_ties()
+    slur_tie_map = {
+        id(symbol): articulations
+        for symbol, articulations in zip(note_chord.symbols, slur_tie_groups, strict=False)
+    }
     by_duration = _group_notes(note_chord.symbols)
     result = []
     final_duration = Fraction(0)
@@ -536,9 +644,9 @@ def build_note_chord(
         is_first = True
         for note_loop in by_duration[group_duration]:
             note = note_loop
-            # Disabled slurs and ties until the detection is more robust
-            # if i == 0 and is_first:
-            #    note = note.add_articulations(slurs_ties)
+            slur_ties = slur_tie_map.get(id(note_loop), [])
+            if slur_ties:
+                note = note.add_articulations(slur_ties)
             result.append(build_note_or_rest(note, i, not is_first, state, note_chord.tuplet_mark))
             is_first = False
         if i != len(by_duration) - 1 and group_duration > Fraction(0):

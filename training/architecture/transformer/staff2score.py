@@ -43,6 +43,7 @@ class Staff2Score:
 
     def predict(self, image: NDArray) -> list[EncodedSymbol]:
         image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        cv2.imwrite("this_image_for_stuff_test.png", image)
         imgs_tensor = self._image_to_tensor(image)
         return self._generate(
             imgs_tensor,
