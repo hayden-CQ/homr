@@ -30,7 +30,7 @@ class ConversionState:
         self._available_slur_numbers = list(range(1, 16))
         self._open_ties: dict[tuple[int, str, str], list[int]] = defaultdict(list)
         self._available_tie_numbers: dict[tuple[int, str, str], list[int]] = defaultdict(
-            lambda: list(range(1, 7))
+            lambda: list(range(1, 16))
         )
 
     def start_volta(self, measure_no: int) -> int:
@@ -503,7 +503,8 @@ def build_articulations(
                 number = state.stop_slur(staff, voice)
                 if number is not None:
                     attributes["number"] = number
-            notation.add_child(mxl.XMLSlur(**attributes))
+            if "number" in attributes:
+                notation.add_child(mxl.XMLSlur(**attributes))
         elif articulation == "tieStart":
             attributes = {"type": "start"}
             if staff is not None and voice is not None:
@@ -530,10 +531,10 @@ def build_articulations(
                         alter = _find_child_of_type(pitch, mxl.XMLAlter)
                         lift = str(alter.value_) if alter else "0"
                         number = state.stop_tie(staff, pitch_key, lift)
-                        if number is None:
-                            continue
-                        attributes["number"] = number
-            notation.add_child(mxl.XMLTied(**attributes))
+                        if number is not None:
+                            attributes["number"] = number
+            if "number" in attributes:
+                notation.add_child(mxl.XMLTied(**attributes))
         else:
             raise ValueError("Unsupported articulation " + articulation)
 
