@@ -197,6 +197,9 @@ def build_measures(
     current_measure = mxl.XMLMeasure(number=str(measure_number))
     first_attributes = build_or_get_attributes(current_measure, None)
     first_attributes.add_child(build_divisions(division))
+    max_staff = _max_staff_number(voice)
+    if max_staff > 1:
+        first_attributes.add_child(mxl.XMLStaves(value_=max_staff))
     if is_first_part:
         direction = build_add_time_direction(args)
         if direction:
@@ -337,15 +340,32 @@ def build_part_list(staffs: int) -> mxl.XMLPartList:
     return part_list
 
 
+def _measure_has_musical_content(measure: mxl.XMLMeasure) -> bool:
+    for child in measure.get_children():
+        if isinstance(
+            child,
+            mxl.XMLNote | mxl.XMLBackup | mxl.XMLForward,
+        ):
+            return True
+    return False
+
+
 def build_or_get_attributes(
     measure: mxl.XMLMeasure, last_attributes: mxl.XMLAttributes | None, force_new: bool = False
 ) -> mxl.XMLAttributes:
-    if last_attributes is not None and not force_new:
+    if last_attributes is not None and (not force_new or not _measure_has_musical_content(measure)):
         return last_attributes
 
     attributes = mxl.XMLAttributes()
     measure.add_child(attributes)
     return attributes
+
+
+def _max_staff_number(voice: list[EncodedSymbol]) -> int:
+    max_staff = 1
+    for symbol in voice:
+        max_staff = max(max_staff, get_staff(symbol))
+    return max_staff
 
 
 def build_or_get_barline(measure: mxl.XMLMeasure, location: str) -> mxl.XMLBarline:

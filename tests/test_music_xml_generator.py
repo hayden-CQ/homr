@@ -34,8 +34,8 @@ barline . . . ."""
         xml = generate_xml(XmlGeneratorArguments(), [tokens], "")
         actual = self._xml_to_str(xml)
         expected = """XMLScorePartwise([XMLWork([XMLWorkTitle()]),
-XMLPart([XMLMeasure([XMLAttributes([XMLDivisions(value: 4)]),
-XMLAttributes([XMLKey([XMLFifths(value: 4)]),
+XMLPart([XMLMeasure([XMLAttributes([XMLDivisions(value: 4),
+XMLKey([XMLFifths(value: 4)]),
 XMLTime([XMLBeats(value: 6),
 XMLBeatType(value: 8)]),
 XMLClef([XMLSign(value: G),
@@ -99,8 +99,9 @@ barline . . . ."""
         xml = generate_xml(XmlGeneratorArguments(), [tokens], "")
         actual = self._xml_to_str(xml)
         expected = """XMLScorePartwise([XMLWork([XMLWorkTitle()]),
-XMLPart([XMLMeasure([XMLAttributes([XMLDivisions(value: 1)]),
-XMLAttributes([XMLKey([XMLFifths(value: 1)]),
+XMLPart([XMLMeasure([XMLAttributes([XMLDivisions(value: 1),
+XMLStaves(value: 2),
+XMLKey([XMLFifths(value: 1)]),
 XMLTime([XMLBeats(value: 4),
 XMLBeatType(value: 4)]),
 XMLClef([XMLSign(value: G),
