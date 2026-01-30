@@ -4,6 +4,7 @@ import re
 import unittest
 from typing import Any
 
+import musicxml.xmlelement.xmlelement as mxl
 from homr.music_xml_generator import SymbolChord, XmlGeneratorArguments, generate_xml
 from homr.transformer.vocabulary import EncodedSymbol
 from training.transformer.training_vocabulary import (
@@ -33,8 +34,8 @@ barline . . . ."""
         xml = generate_xml(XmlGeneratorArguments(), [tokens], "")
         actual = self._xml_to_str(xml)
         expected = """XMLScorePartwise([XMLWork([XMLWorkTitle()]),
-XMLPart([XMLMeasure([XMLAttributes([XMLDivisions(value: 4)]),
-XMLAttributes([XMLKey([XMLFifths(value: 4)]),
+XMLPart([XMLMeasure([XMLAttributes([XMLDivisions(value: 4),
+XMLKey([XMLFifths(value: 4)]),
 XMLTime([XMLBeats(value: 6),
 XMLBeatType(value: 8)]),
 XMLClef([XMLSign(value: G),
@@ -98,8 +99,9 @@ barline . . . ."""
         xml = generate_xml(XmlGeneratorArguments(), [tokens], "")
         actual = self._xml_to_str(xml)
         expected = """XMLScorePartwise([XMLWork([XMLWorkTitle()]),
-XMLPart([XMLMeasure([XMLAttributes([XMLDivisions(value: 1)]),
-XMLAttributes([XMLKey([XMLFifths(value: 1)]),
+XMLPart([XMLMeasure([XMLAttributes([XMLDivisions(value: 1),
+XMLStaves(value: 2),
+XMLKey([XMLFifths(value: 1)]),
 XMLTime([XMLBeats(value: 4),
 XMLBeatType(value: 4)]),
 XMLClef([XMLSign(value: G),
@@ -167,7 +169,141 @@ XMLNotations()])])])])"""
                 ]
             ),
         )
-        self.assertEqual(articulations, ["slurStop", "tieStart"])
+        self.assertEqual(
+            articulations,
+            [
+                [],
+                ["tieStart", "slurStop"],
+                ["tieStart"],
+            ],
+        )
+
+    def test_parallel_slurs_have_unique_numbers(self) -> None:
+        tokens = read_token_lines(
+            """clef_G2 _ _ _ upper&clef_F4 _ _ _ lower
+note_4 C5 # slurStart upper&note_4 E3 _ slurStart lower
+note_4 D5 # slurStop upper&note_4 F3 _ slurStop lower
+barline . . . .""".splitlines()
+        )
+        xml = generate_xml(XmlGeneratorArguments(), [tokens], "")
+        slurs: list[tuple[str, int | None, int | None]] = []
+
+        def walk(node: Any, staff: int | None = None) -> None:
+            if isinstance(node, list):
+                for child in node:
+                    walk(child, staff)
+                return
+            if isinstance(node, mxl.XMLNote):
+                note_staff = staff
+                for child in node.get_children_of_type(mxl.XMLStaff):
+                    note_staff = int(child.value_)
+                    break
+                for child in node.get_children():
+                    walk(child, note_staff)
+                return
+            if isinstance(node, mxl.XMLSlur):
+                slurs.append((node.type, getattr(node, "number", None), staff))
+                return
+            if hasattr(node, "get_children"):
+                for child in node.get_children():
+                    walk(child, staff)
+
+        walk(xml)
+
+        self.assertCountEqual(
+            slurs,
+            [
+                ("start", 1, 1),
+                ("stop", 1, 1),
+                ("start", 2, 2),
+                ("stop", 2, 2),
+            ],
+        )
+
+    def test_parallel_ties_have_unique_numbers(self) -> None:
+        tokens = read_token_lines(
+            """clef_G2 _ _ _ upper&clef_F4 _ _ _ lower
+note_4 C5 # tieStart upper&note_4 C3 # tieStart lower
+note_4 C5 # tieStop upper&note_4 C3 # tieStop lower
+barline . . . .""".splitlines()
+        )
+        xml = generate_xml(XmlGeneratorArguments(), [tokens], "")
+        ties: list[tuple[str, int | None, int | None]] = []
+
+        def walk(node: Any, staff: int | None = None) -> None:
+            if isinstance(node, list):
+                for child in node:
+                    walk(child, staff)
+                return
+            if isinstance(node, mxl.XMLNote):
+                note_staff = staff
+                for child in node.get_children_of_type(mxl.XMLStaff):
+                    note_staff = int(child.value_)
+                    break
+                for child in node.get_children():
+                    walk(child, note_staff)
+                return
+            if isinstance(node, mxl.XMLTied):
+                ties.append((node.type, getattr(node, "number", None), staff))
+                return
+            if hasattr(node, "get_children"):
+                for child in node.get_children():
+                    walk(child, staff)
+
+        walk(xml)
+
+        self.assertCountEqual(
+            ties,
+            [
+                ("start", 1, 1),
+                ("stop", 1, 1),
+                ("start", 1, 2),
+                ("stop", 1, 2),
+            ],
+        )
+
+    def test_ties_keep_numbers_when_voice_changes(self) -> None:
+        tokens = read_token_lines(
+            """clef_G2 _ _ _ upper&clef_F4 _ _ _ lower
+note_8 C5 # _ upper&note_4 G4 # tieStart upper
+note_4 G4 # tieStop upper
+barline . . . .""".splitlines()
+        )
+        xml = generate_xml(XmlGeneratorArguments(), [tokens], "")
+        ties: list[tuple[str, int | None, int | None, int | None]] = []
+
+        def walk(node: Any, staff: int | None = None, voice: int | None = None) -> None:
+            if isinstance(node, list):
+                for child in node:
+                    walk(child, staff, voice)
+                return
+            if isinstance(node, mxl.XMLNote):
+                note_staff = staff
+                note_voice = voice
+                for child in node.get_children_of_type(mxl.XMLStaff):
+                    note_staff = int(child.value_)
+                    break
+                for child in node.get_children_of_type(mxl.XMLVoice):
+                    note_voice = int(child.value_)
+                    break
+                for child in node.get_children():
+                    walk(child, note_staff, note_voice)
+                return
+            if isinstance(node, mxl.XMLTied):
+                ties.append((node.type, getattr(node, "number", None), staff, voice))
+                return
+            if hasattr(node, "get_children"):
+                for child in node.get_children():
+                    walk(child, staff, voice)
+
+        walk(xml)
+        self.assertCountEqual(
+            ties,
+            [
+                ("start", 1, 1, 2),
+                ("stop", 1, 1, 1),
+            ],
+        )
 
     def test_begin_chord_with_standalone_rests(self) -> None:
         """

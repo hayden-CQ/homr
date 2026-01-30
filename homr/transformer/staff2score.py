@@ -20,7 +20,6 @@ class Staff2Score:
         self.config = config
         self.encoder = Encoder(self.config)
         self.decoder = get_decoder(self.config)
-
         if not os.path.exists(self.config.filepaths.rhythmtokenizer):
             raise RuntimeError(
                 "Failed to find tokenizer config" + self.config.filepaths.rhythmtokenizer
@@ -30,6 +29,8 @@ class Staff2Score:
         """
         Inference an image (NDArray) using Tromr.
         """
+        import cv2
+
         x = _transform(image=image)
 
         t0 = perf_counter()
