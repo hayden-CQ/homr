@@ -40,19 +40,10 @@ def apply_beaming(groups: list["SymbolChord"]) -> None:
         for symbol in group.symbols:
             if hasattr(symbol, "beam"):
                 delattr(symbol, "beam")
-            if hasattr(symbol, "beam_number"):
-                delattr(symbol, "beam_number")
-
-    # Use separate beam numbers per staff to ensure they don't conflict:
-    # - Upper (treble): 1
-    # - Lower (bass): 2
-    # Numbers are reused after each beam ends since beams don't overlap
-    beam_numbers = {"upper": 1, "lower": 2}
 
     for staff_position in ("upper", "lower"):
         pending: EncodedSymbol | None = None
         run_length = 0
-        current_beam_number = beam_numbers[staff_position]
         for group in groups:
             if group.is_barline():
                 _finalize_pending_beam(pending, run_length)
@@ -94,13 +85,10 @@ def apply_beaming(groups: list["SymbolChord"]) -> None:
                 continue
 
             pending.beam = "begin" if run_length == 1 else "continue"
-            pending.beam_number = current_beam_number
             pending = candidate
             run_length += 1
 
-        if pending is not None and run_length >= 2:
-            pending.beam = "end"
-            pending.beam_number = current_beam_number
+        _finalize_pending_beam(pending, run_length)
 
 
 class ConversionState:
@@ -708,8 +696,7 @@ def build_note_or_rest(
     note.add_child(mxl.XMLVoice(value_=(str(xml_voice))))
     beam_value = getattr(model_note, "beam", None)
     if beam_value and not is_chord and _is_beamable_note(model_note):
-        beam_number = getattr(model_note, "beam_number", 1)
-        note.add_child(mxl.XMLBeam(value_=beam_value, number=beam_number))
+        note.add_child(mxl.XMLBeam(value_=beam_value, number=1))
     for _ in range(model_duration.dots):
         note.add_child(mxl.XMLDot())
     if model_duration.actual_notes != model_duration.normal_notes:
@@ -751,6 +738,10 @@ def build_note_chord(
     by_duration = _group_notes(note_chord.symbols)
     result = []
     final_duration = Fraction(0)
+    # Use voice 2 for lower staff to separate beam groups between staves
+    voice_offset = 0
+    if note_chord.symbols and note_chord.symbols[0].position == "lower":
+        voice_offset = 1
     for i, group_duration in enumerate(sorted(by_duration)):
         is_first = True
         for note_loop in by_duration[group_duration]:
@@ -758,7 +749,10 @@ def build_note_chord(
             slur_ties = slur_tie_map.get(id(note_loop), [])
             if slur_ties:
                 note = note.add_articulations(slur_ties)
-            result.append(build_note_or_rest(note, i, not is_first, state, note_chord.tuplet_mark))
+            voice = i + voice_offset
+            result.append(
+                build_note_or_rest(note, voice, not is_first, state, note_chord.tuplet_mark)
+            )
             is_first = False
         if i != len(by_duration) - 1 and group_duration > Fraction(0):
             backup = mxl.XMLBackup()
