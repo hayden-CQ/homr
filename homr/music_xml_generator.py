@@ -24,7 +24,9 @@ def _is_beamable_note(symbol: EncodedSymbol) -> bool:
     if "G" in symbol.rhythm:
         return False
     duration = symbol.get_duration()
-    return duration.kern >= 8
+    if duration.fraction <= Fraction(0):
+        return False
+    return duration.fraction < Fraction(1, 4)
 
 
 def _finalize_pending_beam(pending: EncodedSymbol | None, run_length: int) -> None:
@@ -38,10 +40,19 @@ def apply_beaming(groups: list["SymbolChord"]) -> None:
         for symbol in group.symbols:
             if hasattr(symbol, "beam"):
                 delattr(symbol, "beam")
+            if hasattr(symbol, "beam_number"):
+                delattr(symbol, "beam_number")
+
+    # Use separate beam numbers per staff to ensure they don't conflict:
+    # - Upper (treble): 1
+    # - Lower (bass): 2
+    # Numbers are reused after each beam ends since beams don't overlap
+    beam_numbers = {"upper": 1, "lower": 2}
 
     for staff_position in ("upper", "lower"):
         pending: EncodedSymbol | None = None
         run_length = 0
+        current_beam_number = beam_numbers[staff_position]
         for group in groups:
             if group.is_barline():
                 _finalize_pending_beam(pending, run_length)
@@ -83,10 +94,13 @@ def apply_beaming(groups: list["SymbolChord"]) -> None:
                 continue
 
             pending.beam = "begin" if run_length == 1 else "continue"
+            pending.beam_number = current_beam_number
             pending = candidate
             run_length += 1
 
-        _finalize_pending_beam(pending, run_length)
+        if pending is not None and run_length >= 2:
+            pending.beam = "end"
+            pending.beam_number = current_beam_number
 
 
 class ConversionState:
@@ -694,7 +708,8 @@ def build_note_or_rest(
     note.add_child(mxl.XMLVoice(value_=(str(xml_voice))))
     beam_value = getattr(model_note, "beam", None)
     if beam_value and not is_chord and _is_beamable_note(model_note):
-        note.add_child(mxl.XMLBeam(value_=beam_value, number=1))
+        beam_number = getattr(model_note, "beam_number", 1)
+        note.add_child(mxl.XMLBeam(value_=beam_value, number=beam_number))
     for _ in range(model_duration.dots):
         note.add_child(mxl.XMLDot())
     if model_duration.actual_notes != model_duration.normal_notes:
