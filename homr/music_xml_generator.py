@@ -18,6 +18,77 @@ def _find_child_of_type(node: mxl.XMLElement, child_type: type) -> mxl.XMLElemen
     return None
 
 
+def _is_beamable_note(symbol: EncodedSymbol) -> bool:
+    if not symbol.rhythm.startswith("note"):
+        return False
+    if "G" in symbol.rhythm:
+        return False
+    duration = symbol.get_duration()
+    return duration.kern >= 8
+
+
+def _finalize_pending_beam(pending: EncodedSymbol | None, run_length: int) -> None:
+    if pending is None or run_length < 2:
+        return
+    pending.beam = "end"
+
+
+def apply_beaming(groups: list["SymbolChord"]) -> None:
+    for group in groups:
+        for symbol in group.symbols:
+            if hasattr(symbol, "beam"):
+                delattr(symbol, "beam")
+
+    for staff_position in ("upper", "lower"):
+        pending: EncodedSymbol | None = None
+        run_length = 0
+        for group in groups:
+            if group.is_barline():
+                _finalize_pending_beam(pending, run_length)
+                pending = None
+                run_length = 0
+                continue
+
+            staff_chord = None
+            for chord in group.into_positions():
+                if chord.symbols and chord.symbols[0].position == staff_position:
+                    staff_chord = chord
+                    break
+
+            if staff_chord is None:
+                _finalize_pending_beam(pending, run_length)
+                pending = None
+                run_length = 0
+                continue
+
+            candidate = None
+            has_note_or_rest = False
+            for symbol in staff_chord.symbols:
+                if symbol.rhythm.startswith(("note", "rest")):
+                    has_note_or_rest = True
+                if _is_beamable_note(symbol):
+                    candidate = symbol
+                    break
+
+            if candidate is None:
+                if has_note_or_rest:
+                    _finalize_pending_beam(pending, run_length)
+                    pending = None
+                    run_length = 0
+                continue
+
+            if pending is None:
+                pending = candidate
+                run_length = 1
+                continue
+
+            pending.beam = "begin" if run_length == 1 else "continue"
+            pending = candidate
+            run_length += 1
+
+        _finalize_pending_beam(pending, run_length)
+
+
 class ConversionState:
     def __init__(self, division: int, nominator: Fraction):
         self.beats = 4 * constants.duration_of_quarter
@@ -191,6 +262,7 @@ def build_measures(
 ) -> list[mxl.XMLMeasure]:
     measure_number = 1
     groups = add_tuplet_start_stop(group_into_chords(voice))
+    apply_beaming(groups)
     division, nominator = find_division_and_time_signature_nominator(groups)
     state = ConversionState(division, nominator)
     measures: list[mxl.XMLMeasure] = []
@@ -620,6 +692,9 @@ def build_note_or_rest(
     note.add_child(mxl.XMLStaff(value_=staff_value))
     xml_voice = voice + 1
     note.add_child(mxl.XMLVoice(value_=(str(xml_voice))))
+    beam_value = getattr(model_note, "beam", None)
+    if beam_value and not is_chord and _is_beamable_note(model_note):
+        note.add_child(mxl.XMLBeam(value_=beam_value, number=1))
     for _ in range(model_duration.dots):
         note.add_child(mxl.XMLDot())
     if model_duration.actual_notes != model_duration.normal_notes:
