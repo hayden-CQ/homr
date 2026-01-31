@@ -5,11 +5,10 @@ import unittest
 from typing import Any
 
 import musicxml.xmlelement.xmlelement as mxl
+
 from homr.music_xml_generator import SymbolChord, XmlGeneratorArguments, generate_xml
 from homr.transformer.vocabulary import EncodedSymbol
-from training.transformer.training_vocabulary import (
-    read_token_lines,
-)
+from training.transformer.training_vocabulary import read_token_lines
 
 
 class TestMusicXmlGenerator(unittest.TestCase):
