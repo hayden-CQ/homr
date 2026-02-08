@@ -65,12 +65,20 @@ def apply_beaming(groups: list["SymbolChord"]) -> None:
 
             candidate = None
             has_note_or_rest = False
+            has_rest = False
             for symbol in staff_chord.symbols:
-                if symbol.rhythm.startswith(("note", "rest")):
+                if symbol.rhythm.startswith("rest"):
+                    has_rest = True
+                    has_note_or_rest = True
+                elif symbol.rhythm.startswith("note"):
                     has_note_or_rest = True
                 if _is_beamable_note(symbol):
                     candidate = symbol
                     break
+
+            # A rest always breaks the beam, even if chord notes are present
+            if has_rest:
+                candidate = None
 
             if candidate is None:
                 if has_note_or_rest:
