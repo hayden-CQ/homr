@@ -199,15 +199,16 @@ class BarLine(SymbolOnStaff):
 
 
 class Clef(SymbolOnStaff):
-    def __init__(self, box: BoundingBox):
+    def __init__(self, box: BoundingBox, clef_type: str = "unknown"):
         super().__init__(box.center)
         self.box = box
+        self.clef_type = clef_type
 
     def draw_onto_image(self, img: NDArray, color: tuple[int, int, int] = (255, 0, 0)) -> None:
         self.box.draw_onto_image(img, color)
         cv2.putText(
             img,
-            "clef",
+            self.clef_type,
             (self.box.box[0], self.box.box[1]),
             cv2.FONT_HERSHEY_SIMPLEX,
             1,
@@ -217,13 +218,13 @@ class Clef(SymbolOnStaff):
         )
 
     def __str__(self) -> str:
-        return "Clef(" + str(self.center) + ")"
+        return "Clef(" + self.clef_type + ", " + str(self.center) + ")"
 
     def __repr__(self) -> str:
         return str(self)
 
     def copy(self) -> "Clef":
-        return Clef(self.box)
+        return Clef(self.box, self.clef_type)
 
 
 class StaffPoint:
@@ -319,6 +320,24 @@ class Staff(DebugDrawable):
             return None
         return closest_point
 
+    def get_at_median(self, x: float, radius: float = 30.0) -> StaffPoint | None:
+        """Return a StaffPoint at x using median y-values from nearby grid points.
+
+        Takes all grid points within +/-radius of x and returns a synthetic point
+        with median y-values and angle. This filters out local noise from symbols
+        (flags, slurs, beams) crossing staff lines.
+        """
+        neighbors = [p for p in self.grid if abs(p.x - x) <= radius]
+        if not neighbors:
+            return self.get_at(x)
+        if len(neighbors) < 3:
+            return min(neighbors, key=lambda p: abs(p.x - x))
+        median_y = [
+            float(np.median([p.y[i] for p in neighbors])) for i in range(len(neighbors[0].y))
+        ]
+        median_angle = float(np.median([p.angle for p in neighbors]))
+        return StaffPoint(x, median_y, median_angle)
+
     def y_distance_to(self, point: tuple[float, float]) -> float:
         staff_point = self.get_at(point[0])
         if staff_point is None:
@@ -395,6 +414,7 @@ class Staff(DebugDrawable):
     ) -> "Staff":
         copy = Staff([point.transform_coordinates(transformation) for point in self.grid])
         copy.symbols = [symbol.transform_coordinates(transformation) for symbol in self.symbols]
+        copy.is_grandstaff = self.is_grandstaff
         return copy
 
 
@@ -419,12 +439,29 @@ class MultiStaff(DebugDrawable):
         return MultiStaff(unique_staffs, unique_connections)
 
     def create_grandstaffs(self) -> "MultiStaff":
-        if len(self.staffs) == 0:
+        """
+        Blindly creates grandstaffs, by combining staff 0&1, 2&3, ...
+        for odd numbers of staffs the first staff will be a single staff
+        """
+        n = len(self.staffs)
+        if n == 0:
             return self
-        merged = self.staffs[0]
-        for staff in self.staffs[1:]:
-            merged = merged.merge(staff)
-        return MultiStaff([merged], self.connections)
+
+        result = []
+        i = 0
+
+        if n % 2 == 1:
+            result.append(self.staffs[0])
+            i = 1
+
+        while i + 1 < n:
+            result.append(self.staffs[i].merge(self.staffs[i + 1]))
+            i += 2
+
+        if i < n:
+            result.append(self.staffs[i])
+
+        return MultiStaff(result, self.connections)
 
     def break_apart(self) -> list["MultiStaff"]:
         return [MultiStaff([staff], []) for staff in self.staffs]

@@ -1,11 +1,11 @@
+import os
 from collections.abc import Generator, Iterable
 
 import cv2
 import cv2.typing as cvt
 import numpy as np
-from scipy import signal
 
-from homr import constants
+from homr import constants, find_peaks
 from homr.bounding_boxes import (
     DebugDrawable,
     RotatedBoundingBox,
@@ -15,6 +15,16 @@ from homr.debug import Debug
 from homr.model import Staff, StaffPoint
 from homr.simple_logging import eprint
 from homr.type_definitions import NDArray
+
+_diagnose_staffs: bool = os.environ.get("HOMR_DIAGNOSE_STAFFS") == "1"
+_diag_data: dict = {}
+
+
+def get_staff_diagnosis_data() -> dict:
+    """Return accumulated diagnosis data and clear it for next run."""
+    result = _diag_data.copy()
+    _diag_data.clear()
+    return result
 
 
 def prepare_staff_image(img: NDArray) -> NDArray:
@@ -179,6 +189,98 @@ def get_staff_for_anchor(anchor: StaffAnchor, staffs: list[RawStaff]) -> RawStaf
     return None
 
 
+def _merge_colinear_connected_lines(
+    matched_line: StaffLineSegment,
+    connected: list[StaffLineSegment],
+    already_used: list[StaffLineSegment],
+    ref_x: float,
+    unit_size: float,
+) -> StaffLineSegment:
+    """Merge other connected lines at the same y-position into matched_line.
+
+    When connect_staff_lines can't bridge large gaps, a single physical staff line
+    becomes multiple connected lines. This merges them back together.
+
+    Only merges lines that don't overlap significantly in x (separate segments
+    of the same line) and agree in y at their junction point.
+    """
+    used_set = {id(line) for line in already_used}
+    used_set.add(id(matched_line))
+    merged = False
+    for line in connected:
+        if id(line) in used_set:
+            continue
+        # Don't merge lines that significantly overlap in x — they're different staff lines
+        overlap_start = max(matched_line.min_x, line.min_x)
+        overlap_end = min(matched_line.max_x, line.max_x)
+        overlap = max(0.0, overlap_end - overlap_start)
+        shorter_width = min(
+            matched_line.max_x - matched_line.min_x,
+            line.max_x - line.min_x,
+        )
+        if shorter_width > 0 and overlap > 0.2 * shorter_width:
+            continue
+        # Compare y at the junction point (minimizes extrapolation error)
+        if matched_line.max_x < line.min_x:
+            junction_x = (matched_line.max_x + line.min_x) / 2
+        elif line.max_x < matched_line.min_x:
+            junction_x = (line.max_x + matched_line.min_x) / 2
+        else:
+            junction_x = (overlap_start + overlap_end) / 2
+        m_frag = min(matched_line.staff_fragments, key=lambda f: abs(f.center[0] - junction_x))
+        l_frag = min(line.staff_fragments, key=lambda f: abs(f.center[0] - junction_x))
+        dist = abs(
+            m_frag.get_center_extrapolated(junction_x) - l_frag.get_center_extrapolated(junction_x)
+        )
+        if dist < unit_size / 2:
+            matched_line = matched_line.merge(line)
+            used_set.add(id(line))
+            merged = True
+    if merged and _diagnose_staffs:
+        eprint(
+            f"    [diag] merged colinear lines: now {len(matched_line.staff_fragments)} fragments,"
+            f" x=[{matched_line.min_x:.0f},{matched_line.max_x:.0f}]"
+        )
+    return matched_line
+
+
+def _find_closest_connected_line(
+    anchor_line: StaffLineSegment,
+    connected: list[StaffLineSegment],
+    already_used: list[StaffLineSegment],
+    ref_x: float,
+    unit_size: float,
+) -> StaffLineSegment | None:
+    """Find the connected line closest in y to anchor_line that hasn't been used yet.
+
+    Only returns a match if the y-distance is less than a third of unit_size
+    (same staff line should be very close in y).
+    """
+    anchor_y = anchor_line.staff_fragments[0].get_center_extrapolated(ref_x)
+    used_set = {id(line) for line in already_used}
+    best: StaffLineSegment | None = None
+    best_dist = float("inf")
+    for line in connected:
+        if id(line) in used_set:
+            continue
+        # Get y of this connected line at ref_x
+        frag = line.get_at(ref_x)
+        if frag is not None:
+            line_y = frag.get_center_extrapolated(ref_x)
+        else:
+            # Use the fragment closest to ref_x
+            closest = min(line.staff_fragments, key=lambda f: abs(f.center[0] - ref_x))
+            line_y = closest.get_center_extrapolated(ref_x)
+        dist = abs(line_y - anchor_y)
+        if dist < best_dist:
+            best_dist = dist
+            best = line
+    # Accept if within a third of unit_size — same staff line should be very close
+    if best is not None and best_dist < unit_size / 3:
+        return best
+    return None
+
+
 def find_raw_staffs_by_connecting_line_fragments(
     anchors: list[StaffAnchor], staff_fragments: list[RotatedBoundingBox]
 ) -> list[RawStaff]:
@@ -197,20 +299,70 @@ def find_raw_staffs_by_connecting_line_fragments(
         ]
         connected = connect_staff_lines(fragments, anchor.average_unit_size)
         staff_lines: list[StaffLineSegment] = []
-        for anchor_line in anchor.staff_lines:
+        for line_idx, anchor_line in enumerate(anchor.staff_lines):
             line_requirement = set(anchor_line.staff_fragments)
             matching_anchor = [
                 line for line in connected if line_requirement.issubset(set(line.staff_fragments))
             ]
+            matched_line: StaffLineSegment | None = None
             if len(matching_anchor) == 1:
-                staff_lines.extend(matching_anchor)
+                matched_line = matching_anchor[0]
             else:
+                # Fallback: find the connected line closest in y to this anchor line
+                matched_line = _find_closest_connected_line(
+                    anchor_line,
+                    connected,
+                    staff_lines,
+                    anchor.symbol.center[0],
+                    anchor.average_unit_size,
+                )
+                if matched_line is not None and _diagnose_staffs:
+                    eprint(
+                        f"  [diag] line_match: anchor y={anchor.symbol.center[1]:.0f}"
+                        f" line {line_idx}: {len(matching_anchor)} subset matches,"
+                        f" using closest connected line"
+                        f" (width={matched_line.max_x - matched_line.min_x:.0f})"
+                    )
+
+            # If the matched line is short, try to merge with longer lines at the same y
+            if matched_line is not None:
+                matched_line = _merge_colinear_connected_lines(
+                    matched_line,
+                    connected,
+                    staff_lines,
+                    anchor.symbol.center[0],
+                    anchor.average_unit_size,
+                )
+                staff_lines.append(matched_line)
+            else:
+                if _diagnose_staffs:
+                    anchor_width = anchor_line.max_x - anchor_line.min_x
+                    eprint(
+                        f"  [diag] line_match: anchor y={anchor.symbol.center[1]:.0f}"
+                        f" line {line_idx}: {len(matching_anchor)} matches,"
+                        f" no close connected line found"
+                        f" (fallback to anchor_line width={anchor_width:.0f},"
+                        f" connected has {len(connected)} lines)"
+                    )
                 staff_lines.append(anchor_line)
         if existing_staff:
+            if _diagnose_staffs:
+                eprint(
+                    f"  [diag] anchor at y={anchor.symbol.center[1]:.0f}"
+                    f" merged into staff {existing_staff.staff_id}"
+                    f" (y={existing_staff.min_y:.0f}-{existing_staff.max_y:.0f})"
+                )
             staffs.remove(existing_staff)
             staffs.append(existing_staff.merge(RawStaff(staff_id, staff_lines, [anchor])))
         else:
-            staffs.append(RawStaff(staff_id, staff_lines, [anchor]))
+            new_staff = RawStaff(staff_id, staff_lines, [anchor])
+            if _diagnose_staffs:
+                eprint(
+                    f"  [diag] new staff {staff_id} from anchor at"
+                    f" y={anchor.symbol.center[1]:.0f}"
+                    f" (y={new_staff.min_y:.0f}-{new_staff.max_y:.0f})"
+                )
+            staffs.append(new_staff)
         staff_id += 1
     return staffs
 
@@ -229,9 +381,61 @@ def remove_duplicate_staffs(staffs: list[RawStaff]) -> list[RawStaff]:
         staff_duplicates = 2
         if len(overlapping) >= staff_duplicates:
             # Think this through again, for the moment we just take the existing ones
+            if _diagnose_staffs:
+                eprint(
+                    f"  [diag] dedup: staff {staff.staff_id}"
+                    f" (y={staff.min_y:.0f}-{staff.max_y:.0f},"
+                    f" anchors={len(staff.anchors)})"
+                    f" overlaps {len(overlapping)} existing staffs, dropped"
+                )
+                if "duplicate_removals" not in _diag_data:
+                    _diag_data["duplicate_removals"] = []
+                _diag_data["duplicate_removals"].append(
+                    {
+                        "kept": {
+                            "staff_ids": [s.staff_id for s in overlapping],
+                            "anchors": [len(s.anchors) for s in overlapping],
+                        },
+                        "removed": {
+                            "staff_id": staff.staff_id,
+                            "anchors": len(staff.anchors),
+                            "y_range": [round(staff.min_y), round(staff.max_y)],
+                        },
+                        "reason": "overlaps_multiple",
+                    }
+                )
             continue
         if len(overlapping[0].anchors) < len(staff.anchors):
             # The staff with the most anchors is the most reliable one
+            if _diagnose_staffs:
+                kept = staff
+                removed = overlapping[0]
+                eprint(
+                    f"  [diag] dedup: staff {kept.staff_id}"
+                    f" (anchors={len(kept.anchors)}) replaces"
+                    f" staff {removed.staff_id}"
+                    f" (anchors={len(removed.anchors)})"
+                )
+                if "duplicate_removals" not in _diag_data:
+                    _diag_data["duplicate_removals"] = []
+                _diag_data["duplicate_removals"].append(
+                    {
+                        "kept": {
+                            "staff_id": staff.staff_id,
+                            "anchors": len(staff.anchors),
+                            "y_range": [round(staff.min_y), round(staff.max_y)],
+                        },
+                        "removed": {
+                            "staff_id": overlapping[0].staff_id,
+                            "anchors": len(overlapping[0].anchors),
+                            "y_range": [
+                                round(overlapping[0].min_y),
+                                round(overlapping[0].max_y),
+                            ],
+                        },
+                        "reason": "fewer_anchors",
+                    }
+                )
             result = [s for s in result if s != overlapping[0]]
             result.append(staff)
     return result
@@ -328,6 +532,197 @@ def begins_or_ends_on_one_staff_line(
     return False
 
 
+def _make_wide_search_box(clef_symbol: RotatedBoundingBox) -> RotatedBoundingBox:
+    """Create a wide search box extending right from the clef to bridge fragmented staff lines."""
+    wide_extent = 400
+    box = (
+        (clef_symbol.center[0] + wide_extent / 2, clef_symbol.center[1]),
+        (wide_extent, clef_symbol.size[1]),
+        0,
+    )
+    return RotatedBoundingBox(box, clef_symbol.contours, clef_symbol.debug_id)
+
+
+def _extrapolate_fifth_line(
+    connected_lines: list[StaffLineSegment],
+    symbol: RotatedBoundingBox,
+) -> list[StaffLineSegment] | None:
+    """Try to extrapolate a 5th staff line from 4 consistent lines.
+
+    Returns the 5-line list on success, or None if spacing is inconsistent.
+    """
+    if len(connected_lines) != 4:
+        return None
+
+    # Sort lines top-to-bottom by y at symbol x
+    sx = symbol.center[0]
+    lines_sorted = sorted(
+        connected_lines,
+        key=lambda line: line.staff_fragments[0].get_center_extrapolated(sx),
+    )
+    y_positions = [line.staff_fragments[0].get_center_extrapolated(sx) for line in lines_sorted]
+    gaps = [y_positions[i + 1] - y_positions[i] for i in range(3)]
+    median_gap = float(np.median(gaps))
+
+    if median_gap <= 0:
+        return None
+
+    # All 3 gaps must be within 30% of median
+    for g in gaps:
+        if abs(g - median_gap) / median_gap > 0.30:
+            # One gap is significantly different — check if it's ~2× (missing line inside)
+            break
+    else:
+        # All gaps consistent — missing line is at one end
+        # Use symbol bounding box to determine which end
+        top_y = y_positions[0]
+        bot_y = y_positions[3]
+        sym_top = symbol.center[1] - symbol.size[1] / 2
+        sym_bot = symbol.center[1] + symbol.size[1] / 2
+        overshoot_top = top_y - sym_top  # positive = symbol extends above top line
+        overshoot_bot = sym_bot - bot_y  # positive = symbol extends below bottom line
+
+        if overshoot_bot > overshoot_top:
+            # Missing line is at the bottom
+            source_line = lines_sorted[3]
+            shift = median_gap
+            direction = "bottom"
+        else:
+            # Missing line is at the top
+            source_line = lines_sorted[0]
+            shift = -median_gap
+            direction = "top"
+
+        new_line = _shift_staff_line_segment(source_line, shift)
+        if direction == "bottom":
+            result = list(lines_sorted) + [new_line]
+        else:
+            result = [new_line] + list(lines_sorted)
+
+        if _diagnose_staffs:
+            eprint(
+                f"  [diag] extrapolated 5th line from 4 consistent lines"
+                f" at ({symbol.center[0]:.0f}, {symbol.center[1]:.0f}),"
+                f" direction={direction}"
+            )
+        return result
+
+    # Check if exactly one gap is ~2× the others (missing line is inside that gap)
+    large_gap_idx = None
+    valid = True
+    for i, g in enumerate(gaps):
+        ratio = g / median_gap
+        if ratio > 1.5 and ratio < 2.5:
+            if large_gap_idx is not None:
+                valid = False  # Multiple large gaps
+                break
+            large_gap_idx = i
+        elif abs(g - median_gap) / median_gap > 0.30:
+            valid = False  # Inconsistent gap that's not a 2× gap
+            break
+
+    if not valid or large_gap_idx is None:
+        return None
+
+    # Insert at midpoint of the large gap
+    half_gap = gaps[large_gap_idx] / 2
+    new_line = _shift_staff_line_segment(lines_sorted[large_gap_idx], half_gap)
+    result = list(lines_sorted)
+    result.insert(large_gap_idx + 1, new_line)
+
+    if _diagnose_staffs:
+        eprint(
+            f"  [diag] extrapolated 5th line from 4 lines"
+            f" at ({symbol.center[0]:.0f}, {symbol.center[1]:.0f}),"
+            f" direction=between lines {large_gap_idx} and {large_gap_idx + 1}"
+        )
+    return result
+
+
+def _shift_staff_line_segment(source: StaffLineSegment, y_shift: float) -> StaffLineSegment:
+    """Create a new StaffLineSegment by shifting all fragments of source by y_shift."""
+    shifted_fragments = []
+    for frag in source.staff_fragments:
+        new_box: cvt.RotatedRect = (
+            (frag.box[0][0], frag.box[0][1] + y_shift),
+            frag.box[1],
+            frag.box[2],
+        )
+        shifted_fragments.append(RotatedBoundingBox(new_box, frag.contours, frag.debug_id))
+    return StaffLineSegment(source.debug_id + 100, shifted_fragments)
+
+
+def _try_create_anchor(
+    symbol: RotatedBoundingBox,
+    staff_lines: list[RotatedBoundingBox],
+    are_clefs: bool,
+    best_line_count: int,
+    best_rejection_reason: str,
+    allow_extrapolation: bool = False,
+) -> StaffAnchor | tuple[int, str]:
+    """Try to create a StaffAnchor at the given symbol position.
+
+    Returns StaffAnchor on success, or (best_line_count, best_rejection_reason) on failure.
+    """
+    estimated_unit_size = round(symbol.size[1] / (constants.number_of_lines_on_a_staff - 1))
+    thickened_bar_line = symbol.make_box_taller(estimated_unit_size)
+    overlapping_staff_lines = [
+        line for line in staff_lines if line.is_intersecting(thickened_bar_line)
+    ]
+    connected_lines = connect_staff_lines(overlapping_staff_lines, estimated_unit_size)
+    lines_before_filter = len(connected_lines)
+    if _diagnose_staffs and are_clefs:
+        cx, cy = symbol.center
+        line_ys = sorted(
+            [l.staff_fragments[0].center[1] for l in connected_lines] if connected_lines else []
+        )
+        eprint(
+            f"  [diag] _try_create_anchor at ({cx:.0f}, {cy:.0f}):"
+            f" symbol_h={symbol.size[1]:.0f}, unit={estimated_unit_size},"
+            f" search_box_y=[{thickened_bar_line.center[1] - thickened_bar_line.size[1]/2:.0f}"
+            f"..{thickened_bar_line.center[1] + thickened_bar_line.size[1]/2:.0f}],"
+            f" overlapping={len(overlapping_staff_lines)},"
+            f" connected={lines_before_filter},"
+            f" line_ys={[round(y) for y in line_ys]}"
+        )
+    if len(connected_lines) > constants.number_of_lines_on_a_staff:
+        connected_lines = [
+            line
+            for line in connected_lines
+            if (line.max_x - line.min_x) > constants.is_short_connected_line(estimated_unit_size)
+        ]
+        if _diagnose_staffs and are_clefs:
+            eprint(f"  [diag]   after short-line filter: {len(connected_lines)} lines")
+    if not len(connected_lines) == constants.number_of_lines_on_a_staff:
+        if allow_extrapolation:
+            extrapolated = _extrapolate_fifth_line(connected_lines, symbol)
+            if extrapolated is not None:
+                connected_lines = extrapolated
+        if not len(connected_lines) == constants.number_of_lines_on_a_staff:
+            if len(connected_lines) > best_line_count:
+                best_line_count = len(connected_lines)
+                best_rejection_reason = (
+                    f"wrong_line_count ({lines_before_filter} raw,"
+                    f" {len(connected_lines)} after short-line filter, need 5)"
+                )
+            return best_line_count, best_rejection_reason
+    if not are_lines_parallel(connected_lines, estimated_unit_size):
+        if _diagnose_staffs and are_clefs:
+            eprint(f"  [diag]   REJECTED: not_parallel")
+        return len(connected_lines), "not_parallel"
+    if are_lines_crossing(connected_lines):
+        if _diagnose_staffs and are_clefs:
+            eprint(f"  [diag]   REJECTED: lines_crossing")
+        return len(connected_lines), "lines_crossing"
+    if not are_clefs and not begins_or_ends_on_one_staff_line(
+        symbol, connected_lines, estimated_unit_size
+    ):
+        return len(connected_lines), "not_on_staff_line"
+    if _diagnose_staffs and are_clefs:
+        eprint(f"  [diag]   SUCCESS: anchor created")
+    return StaffAnchor(connected_lines, symbol)
+
+
 def find_staff_anchors(
     staff_lines: list[RotatedBoundingBox],
     anchor_symbols: list[RotatedBoundingBox],
@@ -345,12 +740,12 @@ def find_staff_anchors(
         # Therefore we try to detect them at the left and right side of the symbol as well.
         if are_clefs:
             adjacent = [
+                center_symbol.move_to_x_horizontal_by(-10),
                 center_symbol,
-                center_symbol.move_to_x_horizontal_by(50),
-                center_symbol,
-                center_symbol.move_to_x_horizontal_by(100),
-                center_symbol,
-                center_symbol.move_to_x_horizontal_by(150),
+                center_symbol.move_to_x_horizontal_by(10),
+                center_symbol.move_to_x_horizontal_by(30),
+                center_symbol.move_to_x_horizontal_by(60),
+                center_symbol.move_to_x_horizontal_by(80),
             ]
         else:
             adjacent = [
@@ -360,32 +755,73 @@ def find_staff_anchors(
                 center_symbol.move_to_x_horizontal_by(5),
                 center_symbol.move_to_x_horizontal_by(10),
             ]
+        symbol_created_anchor = False
+        best_rejection_reason = ""
+        best_line_count = 0
         for symbol in adjacent:
-            estimated_unit_size = round(symbol.size[1] / (constants.number_of_lines_on_a_staff - 1))
-            thickened_bar_line = symbol.make_box_taller(estimated_unit_size)
-            overlapping_staff_lines = [
-                line for line in staff_lines if line.is_intersecting(thickened_bar_line)
-            ]
-            connected_lines = connect_staff_lines(overlapping_staff_lines, estimated_unit_size)
-            if len(connected_lines) > constants.number_of_lines_on_a_staff:
-                connected_lines = [
-                    line
-                    for line in connected_lines
-                    if (line.max_x - line.min_x)
-                    > constants.is_short_connected_line(estimated_unit_size)
-                ]
-            if not len(connected_lines) == constants.number_of_lines_on_a_staff:
-                continue
-            if not are_lines_parallel(connected_lines, estimated_unit_size):
-                continue
-            if are_lines_crossing(connected_lines):
-                continue
-            if not are_clefs and not begins_or_ends_on_one_staff_line(
-                symbol, connected_lines, estimated_unit_size
-            ):
-                continue
+            anchor = _try_create_anchor(
+                symbol, staff_lines, are_clefs, best_line_count, best_rejection_reason
+            )
+            if isinstance(anchor, StaffAnchor):
+                symbol_created_anchor = True
+                result.append(anchor)
+            else:
+                best_line_count, best_rejection_reason = anchor
 
-            result.append(StaffAnchor(connected_lines, symbol))
+        # Fallback: extrapolate 5th line from 4 consistent lines.
+        # This runs before the wide fallback because extrapolating from 4
+        # cleanly-found lines is more reliable than a wide search box that
+        # often picks up crossing/duplicate lines.
+        if not symbol_created_anchor and best_line_count == 4:
+            for symbol in adjacent:
+                anchor = _try_create_anchor(
+                    symbol,
+                    staff_lines,
+                    are_clefs,
+                    best_line_count,
+                    best_rejection_reason,
+                    allow_extrapolation=True,
+                )
+                if isinstance(anchor, StaffAnchor):
+                    symbol_created_anchor = True
+                    result.append(anchor)
+                    break
+
+        # Fallback for clefs: use a wide search window to bridge fragmented lines
+        if are_clefs and not symbol_created_anchor:
+            wide_symbol = _make_wide_search_box(center_symbol)
+            anchor = _try_create_anchor(
+                wide_symbol, staff_lines, True, best_line_count, best_rejection_reason
+            )
+            if isinstance(anchor, StaffAnchor):
+                symbol_created_anchor = True
+                result.append(anchor)
+                if _diagnose_staffs:
+                    eprint(
+                        f"  [diag] wide fallback succeeded at"
+                        f" ({center_symbol.center[0]:.0f},"
+                        f" {center_symbol.center[1]:.0f})"
+                    )
+            else:
+                best_line_count, best_rejection_reason = anchor
+
+        if _diagnose_staffs and not symbol_created_anchor:
+            cx, cy = center_symbol.center
+            reason = best_rejection_reason or "no_overlapping_lines"
+            eprint(
+                f"  [diag] anchor rejected at ({cx:.0f}, {cy:.0f}):"
+                f" is_clef={are_clefs}, lines={best_line_count}, reason={reason}"
+            )
+            if "anchor_rejections" not in _diag_data:
+                _diag_data["anchor_rejections"] = []
+            _diag_data["anchor_rejections"].append(
+                {
+                    "symbol_center": [round(cx), round(cy)],
+                    "is_clef": are_clefs,
+                    "lines_found": best_line_count,
+                    "reason": reason,
+                }
+            )
     return result
 
 
@@ -398,6 +834,12 @@ def resample_staff_segment(  # noqa: C901
     previous_point = StaffPoint(
         x, centers, float(np.mean([line.angle for line in line_fragments]))
     )  # Dummy point at the anchor points
+    _resample_gaps = 0
+    _resample_partial = 0
+    _resample_displacement_reject = 0
+    _resample_parallel_reject = 0
+    _resample_final_incomplete = 0
+    _resample_yielded = 0
     for x in axis_range:
         lines = [line.get_at(x) for line in staff.lines]
         axis_center = [
@@ -406,13 +848,22 @@ def resample_staff_segment(  # noqa: C901
         center_values = [center for center in axis_center if center is not None]
         incomplete = all(center is None for center in axis_center)
         if incomplete:
+            # Extrapolate previous_point forward so it doesn't go stale during gaps.
+            # Without this, displacement checks reject valid data after long gaps.
+            dx = x - previous_point.x
+            dy = np.tan(previous_point.angle) * dx
+            previous_point = StaffPoint(x, [y + dy for y in previous_point.y], previous_point.angle)
+            _resample_gaps += 1
             continue
+        _resample_partial += 1
+        non_none_before = sum(1 for c in axis_center if c is not None)
         deltas = np.diff(center_values)
         non_parallel = [delta < 0.5 * anchor.average_unit_size for delta in deltas]
         for i, invalid in enumerate(non_parallel):
             if invalid:
                 axis_center[i] = None
                 axis_center[i + 1] = None
+                _resample_parallel_reject += 1
 
         for i, previous_y in enumerate(previous_point.y):
             center_value = axis_center[i]
@@ -420,7 +871,15 @@ def resample_staff_segment(  # noqa: C901
                 center_value is not None
                 and abs(center_value - previous_y) > 0.5 * anchor.average_unit_size
             ):
+                if _diagnose_staffs and _resample_yielded < 3:
+                    eprint(
+                        f"    [diag] resample_reject: x={x} line {i}:"
+                        f" value={center_value:.1f} prev={previous_y:.1f}"
+                        f" delta={abs(center_value - previous_y):.1f}"
+                        f" threshold={0.5 * anchor.average_unit_size:.1f}"
+                    )
                 axis_center[i] = None
+                _resample_displacement_reject += 1
 
         prev_center = -1
         for i in list(range(len(axis_center))) + list(reversed(list(range(len(axis_center))))):
@@ -432,13 +891,31 @@ def resample_staff_segment(  # noqa: C901
                     axis_center[i] = center_value + anchor.average_unit_size * (i - prev_center)
         incomplete = any(center is None for center in axis_center)
         if incomplete:
+            _resample_final_incomplete += 1
+            if _diagnose_staffs and _resample_final_incomplete <= 3:
+                none_indices = [i for i, c in enumerate(axis_center) if c is None]
+                eprint(
+                    f"    [diag] resample_incomplete: x={x}"
+                    f" non_none_before={non_none_before}"
+                    f" none_after_fill={none_indices}"
+                )
             continue
         angle = float(np.mean([line.angle for line in lines if line is not None]))
         previous_point = StaffPoint(x, [c for c in axis_center if c is not None], angle)
+        _resample_yielded += 1
         yield previous_point
+    if _diagnose_staffs and _resample_gaps + _resample_final_incomplete > 20:
+        eprint(
+            f"    [diag] resample_stats: yielded={_resample_yielded}"
+            f" all_none_gaps={_resample_gaps}"
+            f" partial={_resample_partial}"
+            f" displacement_rejects={_resample_displacement_reject}"
+            f" parallel_rejects={_resample_parallel_reject}"
+            f" final_incomplete={_resample_final_incomplete}"
+        )
 
 
-def resample_staff(staff: RawStaff) -> Staff:
+def resample_staff(staff: RawStaff) -> Staff | None:
     anchors_left_to_right = sorted(staff.anchors, key=lambda a: a.symbol.center[0])
     staff_density = 10
 
@@ -468,6 +945,34 @@ def resample_staff(staff: RawStaff) -> Staff:
         grid.extend(reversed(list(resample_staff_segment(anchor, staff, reversed(to_left)))))
         grid.extend(resample_staff_segment(anchor, staff, to_right))
 
+    if _diagnose_staffs:
+        if len(grid) > 0:
+            grid_min_x = grid[0].x
+            grid_max_x = grid[-1].x
+            eprint(
+                f"  [diag] resample: staff y={staff.min_y:.0f}-{staff.max_y:.0f}"
+                f" raw_x=[{staff.min_x:.0f},{staff.max_x:.0f}]"
+                f" grid_x=[{grid_min_x:.0f},{grid_max_x:.0f}]"
+                f" anchors={len(staff.anchors)}"
+                f" grid_points={len(grid)}"
+            )
+        else:
+            eprint(
+                f"  [diag] resample: staff y={staff.min_y:.0f}-{staff.max_y:.0f}"
+                f" raw_x=[{staff.min_x:.0f},{staff.max_x:.0f}]"
+                f" EMPTY GRID — anchors={len(staff.anchors)}"
+            )
+        for line_idx, line in enumerate(staff.lines):
+            frags = line.staff_fragments
+            if frags:
+                min_fx = min(f.center[0] - f.size[0] / 2 for f in frags)
+                max_fx = max(f.center[0] + f.size[0] / 2 for f in frags)
+                eprint(
+                    f"    line {line_idx}: {len(frags)} fragments,"
+                    f" x=[{min_fx:.0f},{max_fx:.0f}]"
+                )
+    if len(grid) == 0:
+        return None
     return Staff(grid)
 
 
@@ -480,22 +985,154 @@ def resample_staffs(staffs: list[RawStaff]) -> list[Staff]:
     """
     result = []
     for staff in staffs:
-        result.append(resample_staff(staff))
+        resampled = resample_staff(staff)
+        if resampled is not None:
+            result.append(resampled)
+    return result
+
+
+def apply_page_warp_consensus(staffs: list[Staff]) -> list[Staff]:
+    """Extend short staves using page-level drift consensus.
+
+    All staves on a page share the same paper curl. Build a consensus drift
+    profile from all staves, then extend any staff that is shorter than the
+    typical page width using the consensus shape.
+    """
+    if len(staffs) < 2:
+        return staffs
+
+    # Step 1: Build drift profiles for each staff
+    # drift(x) = y[2](x) - y[2](x_start), isolating shape from absolute position
+    step = 10
+    global_min_x = int(min(s.min_x for s in staffs))
+    global_max_x = int(max(s.max_x for s in staffs))
+    x_positions = list(range(global_min_x, global_max_x + 1, step))
+
+    staff_drifts: list[dict[int, float]] = []
+    for staff in staffs:
+        drift: dict[int, float] = {}
+        baseline = staff.grid[0].y[2]
+        for p in staff.grid:
+            # Snap to nearest step
+            x_snap = round(p.x / step) * step
+            drift[x_snap] = p.y[2] - baseline
+        staff_drifts.append(drift)
+
+    # Step 2: Build consensus (median drift at each x)
+    consensus: dict[int, float] = {}
+    for x in x_positions:
+        values = [d[x] for d in staff_drifts if x in d]
+        if len(values) >= 2:
+            consensus[x] = float(np.median(values))
+
+    # Step 3: Fill gaps — extend short staves using consensus drift
+    # Find the typical x-range (median start/end across all staves)
+    all_min_x = sorted(int(round(s.min_x / step) * step) for s in staffs)
+    all_max_x = sorted(int(round(s.max_x / step) * step) for s in staffs)
+    typical_min_x = int(np.median(all_min_x))
+    typical_max_x = int(np.median(all_max_x))
+
+    total_extensions = 0
+    result = []
+    for staff in staffs:
+        staff_min = int(round(staff.min_x / step) * step)
+        staff_max = int(round(staff.max_x / step) * step)
+
+        # Only extend if staff is noticeably shorter than typical
+        left_gap = staff_min - typical_min_x
+        right_gap = typical_max_x - staff_max
+        min_gap = step * 5  # at least 50px shorter to bother extending
+
+        if left_gap < min_gap and right_gap < min_gap:
+            result.append(staff)
+            continue
+
+        # Anchor: use the staff's edge grid point and the consensus drift at that edge
+        edge_left = staff.grid[0]
+        edge_right = staff.grid[-1]
+        edge_left_snap = int(round(edge_left.x / step) * step)
+        edge_right_snap = int(round(edge_right.x / step) * step)
+        consensus_at_left = consensus.get(edge_left_snap)
+        consensus_at_right = consensus.get(edge_right_snap)
+
+        new_points_left: list[StaffPoint] = []
+        new_points_right: list[StaffPoint] = []
+
+        # Extend left
+        if left_gap >= min_gap and consensus_at_left is not None:
+            for x in range(typical_min_x, staff_min, step):
+                if x not in consensus:
+                    continue
+                # delta = how much the consensus drifts from the staff edge to this x
+                drift_delta = consensus[x] - consensus_at_left
+                new_y = [edge_left.y[i] + drift_delta for i in range(len(edge_left.y))]
+                new_points_left.append(StaffPoint(float(x), new_y, edge_left.angle))
+                total_extensions += 1
+
+        # Extend right
+        if right_gap >= min_gap and consensus_at_right is not None:
+            for x in range(staff_max + step, typical_max_x + step, step):
+                if x not in consensus:
+                    continue
+                drift_delta = consensus[x] - consensus_at_right
+                new_y = [edge_right.y[i] + drift_delta for i in range(len(edge_right.y))]
+                new_points_right.append(StaffPoint(float(x), new_y, edge_right.angle))
+                total_extensions += 1
+
+        if new_points_left or new_points_right:
+            extended_grid = new_points_left + staff.grid + new_points_right
+            new_staff = Staff(extended_grid)
+            new_staff.symbols = staff.symbols
+            new_staff.is_grandstaff = staff.is_grandstaff
+            result.append(new_staff)
+        else:
+            result.append(staff)
+
+    if total_extensions > 0:
+        eprint(f"Page warp consensus: extended {total_extensions} points")
+        if _diagnose_staffs:
+            _diag_data["warp_consensus"] = {
+                "total_extensions": total_extensions,
+                "staff_count": len(staffs),
+            }
+
     return result
 
 
 def filter_edge_of_vision(staffs: list[Staff], image_shape: tuple[int, ...]) -> list[Staff]:
     """
-    Removes staffs which begin in at the right edge or at the lower edge of the image,
-    as this are very likely incomplete staffs.
+    Removes staffs which are outside the page dimensions.
     """
+    staff_widths = np.array([s.max_x - s.min_x for s in staffs], dtype=float)
+    usual_width = np.average(staff_widths)
+
     result = []
     for staff in staffs:
-        starts_at_right_edge = staff.min_x > 0.90 * image_shape[1]
-        starts_at_bottom_edge = staff.min_y > 0.95 * image_shape[0]
-        ends_at_left_edge = staff.max_x < 0.20 * image_shape[1]
-        if any([starts_at_right_edge, starts_at_bottom_edge, ends_at_left_edge]):
+        beyond_bottom = staff.max_y >= image_shape[0]
+        beyond_top = staff.min_y < 0
+        if beyond_bottom or beyond_top:
             continue
+
+        staff_width = staff.max_x - staff.min_x
+
+        # Drop tiny fragments (< 10% of usual width) regardless of position
+        if staff_width < usual_width * 0.1:
+            if _diagnose_staffs:
+                eprint(
+                    f"  [diag] edge_filter: dropped staff at"
+                    f" y={staff.min_y:.0f}-{staff.max_y:.0f},"
+                    f" width={staff_width:.0f} ({100 * staff_width / usual_width:.0f}%"
+                    f" of usual {usual_width:.0f})"
+                )
+            continue
+
+        shorter_than_usual = staff_width < usual_width / 2
+        beyond_left = staff.min_x < 0.01 * image_shape[1]
+        beyond_right = staff.max_x > 0.99 * image_shape[1]
+
+        if (beyond_left or beyond_right) and shorter_than_usual:
+            continue
+
         result.append(staff)
     return result
 
@@ -508,11 +1145,16 @@ def filter_unusual_anchors(anchors: list[StaffAnchor]) -> list[StaffAnchor]:
     if len(anchors) == 0:
         return anchors
     unit_sizes = [anchor.average_unit_size for anchor in anchors]
-    average_unit_size = np.mean(unit_sizes)
-    unit_size_deviation = np.std(unit_sizes)
+    average_unit_size = float(np.mean(unit_sizes))
+    unit_size_deviation = float(np.std(unit_sizes))
+    if _diagnose_staffs:
+        eprint(
+            f"  [diag] filter_unusual_anchors: mean_unit_size={average_unit_size:.2f},"
+            f" std={unit_size_deviation:.2f}, count={len(anchors)}"
+        )
     result = []
     for anchor in anchors:
-        if abs(anchor.average_unit_size - average_unit_size) > 2 * unit_size_deviation:
+        if abs(anchor.average_unit_size - average_unit_size) > 3 * unit_size_deviation:
             continue
         result.append(anchor)
     return result
@@ -605,9 +1247,11 @@ def find_horizontal_lines(
     for y in sub_ys:
         count[y] += 1
 
-    count = np.insert(count, [0, len(count)], [0, 0])  # type: ignore
+    count = np.insert(count, [0, len(count)], [0, 0])
     norm = (count - np.mean(count)) / np.std(count)
-    centers, _ = signal.find_peaks(norm, height=line_threshold, distance=unit_size, prominence=1)
+    centers, _ = find_peaks.find_peaks(
+        norm, height=line_threshold, distance=unit_size, prominence=1
+    )
     centers -= 1
     norm = norm[1:-1]  # Remove prepend / append
     _valid_centers, groups = filter_line_peaks(centers, norm)
@@ -658,12 +1302,12 @@ def break_wide_fragments(
     for fragment in fragments:
         remaining_fragment = fragment
         while remaining_fragment.size[0] > limit:
-            min_x = min([c[0][0] for c in remaining_fragment.contours])  # type: ignore
-            contours_left = [c for c in remaining_fragment.contours if c[0][0] < min_x + limit]  # type: ignore
-            contours_right = [c for c in remaining_fragment.contours if c[0][0] >= min_x + limit]  # type: ignore
+            min_x = min([c[0][0] for c in remaining_fragment.contours])
+            contours_left = [c for c in remaining_fragment.contours if c[0][0] < min_x + limit]
+            contours_right = [c for c in remaining_fragment.contours if c[0][0] >= min_x + limit]
             # sort by x
-            contours_left = sorted(contours_left, key=lambda c: c[0][0])  # type: ignore
-            contours_right = sorted(contours_right, key=lambda c: c[0][0])  # type: ignore
+            contours_left = sorted(contours_left, key=lambda c: c[0][0])
+            contours_right = sorted(contours_right, key=lambda c: c[0][0])
             if len(contours_left) == 0 or len(contours_right) == 0:
                 break
             # Make sure that the contours remain connected by adding
@@ -680,6 +1324,59 @@ def break_wide_fragments(
     return result
 
 
+def _write_diagnosis_overlay(
+    debug: Debug,
+    image: NDArray,
+    final_staffs: list[Staff],
+    rejected_raw_staffs: list[RawStaff],
+    all_anchors: list[StaffAnchor],
+    failed_clefs: list[RotatedBoundingBox],
+    failed_barlines: list[RotatedBoundingBox],
+) -> None:
+    """Write a diagnostic overlay image showing accepted/rejected staves and anchors."""
+    overlay = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR) if len(image.shape) == 2 else image.copy()
+
+    # Green lines: final accepted staves
+    for i, staff in enumerate(final_staffs):
+        for point in staff.grid:
+            for y_val in point.y:
+                x, y = int(point.x), int(y_val)
+                if 0 <= x < overlay.shape[1] and 0 <= y < overlay.shape[0]:
+                    cv2.circle(overlay, (x, y), 1, (0, 255, 0), -1)
+        # Label with staff index
+        if len(staff.grid) > 0:
+            label_x = int(staff.grid[0].x)
+            label_y = int(min(staff.grid[0].y)) - 10
+            cv2.putText(
+                overlay,
+                f"S{i}",
+                (label_x, max(label_y, 15)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2,
+            )
+
+    # Red lines: rejected staves
+    for raw_staff in rejected_raw_staffs:
+        raw_staff.draw_onto_image(overlay, (0, 0, 255))
+
+    # Blue circles: anchor symbols that created anchors
+    for anchor in all_anchors:
+        cx, cy = int(anchor.symbol.center[0]), int(anchor.symbol.center[1])
+        cv2.circle(overlay, (cx, cy), 8, (255, 0, 0), 2)
+
+    # Yellow circles: symbols that failed to create anchors
+    for symbol in failed_clefs:
+        cx, cy = int(symbol.center[0]), int(symbol.center[1])
+        cv2.circle(overlay, (cx, cy), 8, (0, 255, 255), 2)
+    for symbol in failed_barlines:
+        cx, cy = int(symbol.center[0]), int(symbol.center[1])
+        cv2.circle(overlay, (cx, cy), 6, (0, 200, 255), 2)
+
+    debug.write_image("staff_diagnosis", overlay)
+
+
 def detect_staff(
     debug: Debug,
     image: NDArray,
@@ -690,8 +1387,13 @@ def detect_staff(
     """
     Detect staffs on the image. Staffs can be warped, have gaps and can be interrupted by symbols.
     """
+    if _diagnose_staffs:
+        _diag_data.clear()
+        eprint("[diag] Staff detection diagnosis enabled")
+
     staff_anchors = find_staff_anchors(staff_fragments, clefs_keys, are_clefs=True)
-    eprint("Found " + str(len(staff_anchors)) + " clefs")
+    clef_anchor_count = len(staff_anchors)
+    eprint("Found " + str(clef_anchor_count) + " clefs")
 
     possible_other_clefs = predict_other_anchors_from_clefs(staff_anchors, image)
     eprint("Found " + str(len(possible_other_clefs)) + " possible other clefs")
@@ -701,21 +1403,21 @@ def detect_staff(
         find_staff_anchors(staff_fragments, likely_bar_or_rests_lines, are_clefs=False)
     )
 
+    anchors_before_filter = len(staff_anchors)
     staff_anchors = filter_unusual_anchors(staff_anchors)
-    eprint("Found " + str(len(staff_anchors)) + " staff anchors")
+    anchors_after_filter = len(staff_anchors)
+    eprint("Found " + str(anchors_after_filter) + " staff anchors")
     debug.write_bounding_boxes_alternating_colors("staff_anchors", staff_anchors)
 
     raw_staffs_with_possible_duplicates = find_raw_staffs_by_connecting_line_fragments(
         staff_anchors, staff_fragments
     )
-    eprint("Found " + str(len(raw_staffs_with_possible_duplicates)) + " staffs")
+    raw_staff_count = len(raw_staffs_with_possible_duplicates)
+    eprint("Found " + str(raw_staff_count) + " staffs")
     raw_staffs = remove_duplicate_staffs(raw_staffs_with_possible_duplicates)
-    if len(raw_staffs_with_possible_duplicates) != len(raw_staffs):
-        eprint(
-            "Removed "
-            + str(len(raw_staffs_with_possible_duplicates) - len(raw_staffs))
-            + " duplicate staffs"
-        )
+    after_dedup_count = len(raw_staffs)
+    if raw_staff_count != after_dedup_count:
+        eprint("Removed " + str(raw_staff_count - after_dedup_count) + " duplicate staffs")
     debug.write_bounding_boxes_alternating_colors(
         "raw_staffs", raw_staffs + likely_bar_or_rests_lines + clefs_keys
     )
@@ -723,7 +1425,57 @@ def detect_staff(
     staffs = resample_staffs(raw_staffs)
 
     staffs = filter_edge_of_vision(staffs, image.shape)
+    after_edge_count = len(staffs)
 
     staffs = sort_staffs_top_to_bottom(staffs)
+
+    if _diagnose_staffs:
+        # Find which symbols failed to create anchors
+        anchor_symbol_centers = {
+            (round(a.symbol.center[0]), round(a.symbol.center[1])) for a in staff_anchors
+        }
+        failed_clefs = [
+            s
+            for s in clefs_keys
+            if (round(s.center[0]), round(s.center[1])) not in anchor_symbol_centers
+        ]
+        failed_barlines = [
+            s
+            for s in likely_bar_or_rests_lines
+            if (round(s.center[0]), round(s.center[1])) not in anchor_symbol_centers
+        ]
+
+        # Find rejected raw staffs (removed in dedup)
+        kept_ids = {s.staff_id for s in raw_staffs}
+        rejected_raw = [
+            s for s in raw_staffs_with_possible_duplicates if s.staff_id not in kept_ids
+        ]
+
+        _diag_data["summary"] = {
+            "clefs_found": len(clefs_keys),
+            "barlines_found": len(likely_bar_or_rests_lines),
+            "clef_anchors": clef_anchor_count,
+            "anchors_before_filter": anchors_before_filter,
+            "anchors_after_filter": anchors_after_filter,
+            "raw_staffs": raw_staff_count,
+            "after_dedup": after_dedup_count,
+            "after_edge_filter": after_edge_count,
+            "final_staff_count": len(staffs),
+        }
+
+        _diag_data["final_staffs"] = [
+            {
+                "index": i,
+                "y_range": [round(s.min_y), round(s.max_y)],
+                "x_range": [round(s.min_x), round(s.max_x)],
+            }
+            for i, s in enumerate(staffs)
+        ]
+
+        eprint(f"[diag] Summary: {_diag_data['summary']}")
+
+        _write_diagnosis_overlay(
+            debug, image, staffs, rejected_raw, staff_anchors, failed_clefs, failed_barlines
+        )
 
     return staffs
