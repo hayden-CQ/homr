@@ -1,0 +1,134 @@
+# OMR Improvement Pipeline - Design Discussion
+
+**Status:** Adversarial Review
+**Created:** 2026-03-19
+**Participants:** Human + Claude
+
+## Open Discussion Topics
+
+| # | Topic | Status | Notes |
+|---|-------|--------|-------|
+| 1 | Core Requirements | Done | Multi-agent research loop with convergence |
+| 2 | State Document Design | Done | Self-contained doc, pipeline map, archived cycles |
+| 3 | Agent Prompt Template | Done | /research slash command, same for all agents |
+| 4 | Convergence & Exit Criteria | Done | 3 agents agree or 3 cycles then human decides |
+| 5 | First Research Target | Done | No seeded direction, let agents diverge |
+
+## Decisions Made
+
+### 1. Cycle Structure
+
+**Decision:** A cycle = one turn per agent (3 turns). Each agent independently diagnoses, proposes, and critiques existing proposals. Cycles repeat until all 3 agents converge on a single proposal.
+
+**Rationale:**
+- No fixed roles — each agent thinks holistically every turn
+- Divergent perspectives emerge naturally from different models
+- Convergence is earned through genuine agreement, not forced consensus
+- Each agent sees all prior agents' work via the shared state doc
+
+**Cycle flow:**
+```
+Cycle N:
+  Agent A: reads state doc → diagnoses, proposes, critiques existing proposals
+  Agent B: reads updated state → diagnoses, proposes, critiques all proposals
+  Agent C: reads updated state → diagnoses, proposes, critiques all proposals
+
+  If all 3 agree on one proposal → ready for human review
+  If disagreement → Cycle N+1 (max 3 cycles before human checkpoint)
+```
+
+**Implications:**
+- Agents must actively endorse a proposal (state what they checked), not just "agree"
+- Turn order rotates each cycle to prevent order bias
+- Max 3 cycles (9 agent turns) before human checkpoint
+
+### 2. Data Request Protocol
+
+**Decision:** Agents must stop and request data rather than guess. Two priority levels: blocking (cycle pauses) and non-blocking (cycle continues).
+
+**Rationale:**
+- Eval runs are expensive (30+ min for full set)
+- Guessing without data wastes eval runs on bad theories
+
+### 3. Manual Orchestration
+
+**Decision:** Human launches each agent manually in the shared container, passes `/research` command, collects output.
+
+**Rationale:**
+- No automation infrastructure yet
+- Testing the process before building tooling
+- Human maintains control over eval runs (host-only)
+
+### 4. State Document Structure
+
+**Decision:** Single state doc at `plans/research/state.md` with: system overview, baseline data, full 69-piece table, error landscape, available data inventory, known patterns, tried & rejected, pipeline map, active cycle, archived previous cycles.
+
+**Rationale:**
+- Must be self-contained — any agent starts cold from this doc
+- Pipeline map gives orientation without dumping code
+- Full piece table inline so agents can spot patterns
+- Archive completed cycles aggressively to manage size
+
+### 5. Slash Commands
+
+**Decision:** `/research` (run a turn) and `/research-status` (check status) as project-level commands in `.claude/commands/`. Other agents duplicate to their own config dirs on first run.
+
+**Rationale:**
+- Same prompt for all agents — state doc provides differentiation
+- Reusable, less error-prone than copy-pasting prompts
+
+### 6. Convergence & Exit Criteria
+
+**Decision:**
+- Full convergence: all 3 endorse same proposal → ready for eval
+- 3 cycles without convergence: human reviews, picks one or continues
+- Human can endorse single agent's proposal at any point
+- Blocking data requests pause cycle
+- After eval: predictions vs actuals recorded, next cycle starts
+
+**Rationale:**
+- Human is the tiebreaker, not the process
+- Three cycles provides enough signal even without unanimity
+- Recording predictions vs actuals builds institutional knowledge
+
+### 7. First Research Target
+
+**Decision:** No seeded direction. Agents discover priorities from the error data.
+
+**Rationale:**
+- Divergent diagnosis is the whole point
+- State doc has everything they need
+- Constraining loses potential discoveries
+
+## AC Candidates
+
+- All 3 agents must endorse same proposal for automatic "ready for eval"
+- Agent must state what it checked when endorsing
+- Blocking data requests halt the cycle until fulfilled
+- Max 3 cycles before human checkpoint
+- State doc tracks all available data, pending requests, tried & rejected
+- `/research` command works identically across all agent types
+- Predictions vs actuals recorded after every eval run
+
+## Parking Lot
+
+- Automation of agent orchestration (future)
+- Model retraining based on findings (out of scope)
+- Integration with CI/CD (far future)
+- Per-agent strengths mapping (observe first, formalize later)
+
+## Session Log
+
+### 2026-03-19
+- All 5 topics decided
+- State doc written at plans/research/state.md
+- Slash commands created: /research, /research-status
+- Adversarial self-review: 7 concerns raised, all resolved:
+  1. State doc staleness → added "Last updated" timestamp, human updates after eval
+  2. Image capability varies by agent → added rule 8 to prompt (note limitation)
+  3. "Generalizable" too vague → clarified in prompt (specific thresholds OK if data-derived)
+  4. No quality gate → added rule 6 (>1% SER or >500 errors predicted)
+  5. Anchoring on first agent → added rule 7 (investigate alternatives even if you agree)
+  6. No state doc versioning → added rule 9 (git commit after each turn)
+  7. Ties 0% — eval bug or real? → **verified: real.** Output has zero tie elements. Vocabulary has tie tokens but model doesn't generate them. Updated state doc.
+- Ready for Codex adversarial review or first cycle

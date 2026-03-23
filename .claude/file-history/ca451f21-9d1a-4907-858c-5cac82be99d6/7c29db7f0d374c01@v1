@@ -1,0 +1,8 @@
+# Memory Index
+
+- [project_eval_infrastructure.md](project_eval_infrastructure.md) — Historical eval data stored outside repo to survive git operations
+- [project_staff_detection_fix.md](project_staff_detection_fix.md) — Bass clef extrapolation fix: reordered fallback chain in staff_detection.py
+- [feedback_step_by_step.md](feedback_step_by_step.md) — User prefers incremental collaboration over scripted automation
+- [feedback_writable_related.md](feedback_writable_related.md) — /related/ paths are writable, edit directly
+- [feedback_scripts_not_multiline.md](feedback_scripts_not_multiline.md) — Create scripts instead of complex multiline commands
+- [project_bass_template_issue.md](project_bass_template_issue.md) — TrOmr generates template bass patterns at system starts, ignoring actual image content

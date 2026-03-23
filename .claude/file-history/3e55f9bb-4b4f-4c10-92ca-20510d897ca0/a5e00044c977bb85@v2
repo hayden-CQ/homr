@@ -1,0 +1,28 @@
+HOMR_DIR ?= /var/code/projects/chordquest/homr
+GPU ?= no
+PIECE ?=
+TAG ?=
+VENV = .venv/bin/python
+
+.PHONY: eval spot compare html setup help
+
+help: ## Show this help
+	@grep -E '^[a-z_-]+:.*##' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
+
+eval: ## Run full evaluation (HOMR_DIR= TAG= GPU=)
+	$(if $(TAG),TAG=$(TAG) ,)$(VENV) scripts/run_evaluation.py --homr-dir $(HOMR_DIR) --gpu $(GPU)
+
+spot: ## Evaluate one piece (PIECE= HOMR_DIR= GPU=)
+	$(if $(TAG),TAG=$(TAG) ,)$(VENV) scripts/run_evaluation.py --homr-dir $(HOMR_DIR) --piece $(PIECE) --gpu $(GPU)
+
+compare: ## Compare two runs (A= B=) or latest two
+	$(if $(and $(A),$(B)),$(VENV) scripts/compare_runs.py $(A) $(B),$(VENV) scripts/compare_runs.py)
+
+compare-piece: ## Deep-dive one piece (A= B= PIECE=)
+	$(VENV) scripts/compare_runs.py $(A) $(B) --piece $(PIECE)
+
+html: ## Generate HTML reports
+	$(VENV) scripts/generate_html.py
+
+setup: ## Render corpus page images (requires MuseScore)
+	$(VENV) scripts/setup_corpus.py

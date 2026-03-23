@@ -1,0 +1,54 @@
+# Project Profile
+
+## User
+- Working on OMR (Optical Music Recognition) accuracy improvement
+- Hands-on, prefers step-by-step collaboration over fully scripted automation
+- Has a 69-piece evaluation corpus for measuring recognition quality
+- Prefers ergonomic CLI tooling (Makefile, ./run scripts) over raw commands
+- Knows the music pieces well — can spot wrong notes by inspection
+
+## Current Focus
+- Diagnosing piece-025 regression (65% → 121% SER) caused by staff detection changes
+- Branch: `feature/bass-clef-extrapolation-20260317`
+- Two issues found: extra measure from staff overlap (our regression) + TrOmr bass template pattern (pre-existing)
+
+## Architecture Decisions
+- Evaluation data lives OUTSIDE the repo at `/related/homr-eval/` (also accessible via `/var/code/projects/chordquest/homr-eval/`)
+- Git worktrees preferred over checkout-in-place for running different versions
+- No symlinks inside repo (vulnerable to git clean)
+- Builds symlinked in `homr-eval/builds/` pointing to homr dir or worktrees
+
+## Key Technical Details
+- **StaffAnchor system**: Detects 5 parallel staff lines at known symbols (clefs, barlines, rests)
+- **`_try_create_anchor`**: Uses symbol bounding box height to estimate unit size → search window height
+- **Small bass clef detections** (h≈62) create narrow search windows that miss the 5th staff line
+- **Fallback chain in `find_staff_anchors`**: adjacent offsets → extrapolation (4→5 lines) → wide search box → rejection
+- **`HOMR_DIAGNOSE_STAFFS=1`** env var enables diagnostic logging in staff_detection.py
+- **`HOMR_VERBOSE=1`** enables pipeline tracing (TrOmr token counts, post-processing stats)
+- **`HOMR_DISABLE_GEOMETRIC_CORRECTION=1`** disables geometric pitch correction
+- **ONNX models**: Run 286 (old), Run 331 (current, on GitHub releases), Run 287 (Marko's, fp16 only on HuggingFace)
+- Code changes account for 100% of SER improvement (48%→36%); model 286→331 had zero impact
+
+## TrOmr Pipeline (critical for debugging)
+- Each grand staff system → cropped image → TrOmr model → token sequence (EncodedSymbol list)
+- **Measures**: determined by `barline` tokens in TrOmr output (NOT image processing barlines)
+- **Staff assignment**: `position` field ("upper"=staff 1, "lower"=staff 2) from decoder
+- **Pitch**: from pitch token; geometric correction only modifies treble (skips position=="lower")
+- **Crop boundaries**: determined by staff line extents from `find_raw_staffs_by_connecting_line_fragments`
+- If crop overlaps adjacent systems → TrOmr sees extra content → extra measures generated
+
+## Staff Construction Changes (main-331 → our branch)
+- `_merge_colinear_connected_lines`: merges staff line fragments at same y-position
+- `_find_closest_connected_line`: fallback when subset matching fails
+- These can extend staff lines too far, causing system crop overlap
+- 1059 lines changed in staff_detection.py between main-331 and our branch
+
+## Gotchas
+- `git clean -fd` will destroy all untracked evaluation artifacts if stored inside repo
+- The old `run_historical.sh` is dangerous — don't use it, don't fix it
+- `.npy` cache files are model-version-specific — must clear between model boundaries
+- TrOmr inference can OOM on some pages (exit 137) — in container only, not on host
+- `/related/` paths are writable, not read-only
+- The eval script uses `poetry run homr` from the homr dir — runs source code directly
+- fp16 ONNX models need recursive subgraph conversion for CPU inference (nested If/Loop nodes)
+- MusicXML comparison is powerful for diagnosing regressions — compare measure counts + content

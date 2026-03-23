@@ -1,0 +1,703 @@
+#!/usr/bin/env python3
+"""
+Generate browsable HTML reports from evaluation run data.
+
+Standalone script — no imports from the homr repo.
+
+Four levels of interlinked HTML:
+  1. All runs index  — runs/index.html
+  2. Run index       — runs/<effort>/<hash>_avg<ser>/index.html
+  3. Piece index     — .../piece-NNN/index.html
+  4. Page index      — .../piece-NNN/page-NN/index.html
+
+Also generates:
+  - spot/index.html (all spot checks)
+  - spot/piece-NNN/<effort>/<hash>_ser<ser>/index.html
+
+Usage:
+    python scripts/generate_html.py
+    python scripts/generate_html.py --run runs/effort/hash_avg37
+"""
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DATA_DIR = SCRIPT_DIR.parent
+STYLE_CSS = "style.css"
+
+
+# ---------------------------------------------------------------------------
+# CSS
+# ---------------------------------------------------------------------------
+
+CSS = (
+    ":root {\n"
+    "  --green: #4caf50; --light-green: #8bc34a;\n"
+    "  --yellow: #ff9800; --red: #f44336;\n"
+    "  --bg: #fafafa; --card-bg: #fff; --border: #e0e0e0;\n"
+    "  --text: #212121; --text-secondary: #757575;\n"
+    "  --mono: 'Menlo','Consolas','DejaVu Sans Mono',monospace;\n"
+    "}\n"
+    "* { box-sizing: border-box; margin: 0; padding: 0; }\n"
+    "body { font-family: -apple-system,BlinkMacSystemFont,"
+    "'Segoe UI',Roboto,sans-serif;\n"
+    "  background: var(--bg); color: var(--text);\n"
+    "  max-width: 1200px; margin: 0 auto; padding: 20px;\n"
+    "  font-size: 14px; line-height: 1.5; }\n"
+    "h1 { font-size: 1.5em; margin-bottom: 8px; }\n"
+    "h2 { font-size: 1.2em; margin: 20px 0 8px;\n"
+    "  border-bottom: 1px solid var(--border);\n"
+    "  padding-bottom: 4px; }\n"
+    "h3 { font-size: 1.05em; margin: 16px 0 6px; }\n"
+    "a { color: #1976d2; text-decoration: none; }\n"
+    "a:hover { text-decoration: underline; }\n"
+    ".breadcrumb { color: var(--text-secondary);\n"
+    "  margin-bottom: 16px; font-size: 0.9em; }\n"
+    ".breadcrumb a { color: var(--text-secondary); }\n"
+    ".meta { color: var(--text-secondary);\n"
+    "  font-size: 0.9em; margin-bottom: 16px; }\n"
+    ".stats { display: flex; gap: 24px;\n"
+    "  flex-wrap: wrap; margin: 12px 0; }\n"
+    ".stat { background: var(--card-bg);\n"
+    "  border: 1px solid var(--border);\n"
+    "  border-radius: 6px; padding: 12px 16px;\n"
+    "  min-width: 120px; }\n"
+    ".stat-value { font-size: 1.4em; font-weight: bold;\n"
+    "  font-family: var(--mono); }\n"
+    ".stat-label { font-size: 0.8em;\n"
+    "  color: var(--text-secondary); }\n"
+    "table { border-collapse: collapse;\n"
+    "  width: 100%; margin: 8px 0; }\n"
+    "th, td { padding: 6px 10px; text-align: left;\n"
+    "  border-bottom: 1px solid var(--border); }\n"
+    "th { background: #f5f5f5; font-weight: 600;\n"
+    "  font-size: 0.85em; text-transform: uppercase;\n"
+    "  letter-spacing: 0.5px; }\n"
+    "td { font-family: var(--mono); font-size: 0.9em; }\n"
+    "tr:hover { background: #f9f9f9; }\n"
+    ".ser-green { color: var(--green); font-weight: bold; }\n"
+    ".ser-light-green { color: var(--light-green);\n"
+    "  font-weight: bold; }\n"
+    ".ser-yellow { color: var(--yellow); font-weight: bold; }\n"
+    ".ser-red { color: var(--red); font-weight: bold; }\n"
+    ".debug-images { display: flex; flex-wrap: wrap;\n"
+    "  gap: 12px; margin: 12px 0; }\n"
+    ".debug-img { border: 1px solid var(--border);\n"
+    "  border-radius: 4px; overflow: hidden;\n"
+    "  max-width: 380px; }\n"
+    ".debug-img img { width: 100%; height: auto;\n"
+    "  display: block; }\n"
+    ".debug-img .caption { padding: 4px 8px;\n"
+    "  font-size: 0.75em; color: var(--text-secondary);\n"
+    "  background: #f5f5f5; font-family: var(--mono); }\n"
+    ".page-image { margin: 12px 0; }\n"
+    ".page-image img { max-width: 100%;\n"
+    "  border: 1px solid var(--border);\n"
+    "  border-radius: 4px; }\n"
+    ".no-errors { color: var(--green); }\n"
+    ".effort-group { margin: 20px 0; }\n"
+    ".effort-header { font-size: 1.1em; font-weight: bold;\n"
+    "  margin: 12px 0 4px; padding: 4px 0;\n"
+    "  border-left: 4px solid #1976d2;\n"
+    "  padding-left: 8px; }\n"
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _stat(value: str, label: str, cls: str = "") -> str:
+    cls_attr = f" {cls}" if cls else ""
+    return (
+        f'<div class="stat">'
+        f'<div class="stat-value{cls_attr}">{value}</div>'
+        f'<div class="stat-label">{label}</div></div>'
+    )
+
+def _ser_class(ser: int) -> str:
+    if ser <= 20:
+        return "ser-green"
+    if ser <= 35:
+        return "ser-light-green"
+    if ser <= 50:
+        return "ser-yellow"
+    return "ser-red"
+
+
+def _css_path(from_dir: Path) -> str:
+    """Compute relative path from from_dir to DATA_DIR/style.css."""
+    return os.path.relpath(DATA_DIR / STYLE_CSS, from_dir)
+
+
+def _html_page(title: str, breadcrumbs: list[tuple[str, str]], body: str, css_rel: str) -> str:
+    bc_parts = []
+    for i, (label, href) in enumerate(breadcrumbs):
+        if i == len(breadcrumbs) - 1:
+            bc_parts.append(label)
+        else:
+            bc_parts.append(f'<a href="{href}">{label}</a>')
+    bc_html = ' &rsaquo; '.join(bc_parts)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<link rel="stylesheet" href="{css_rel}">
+</head>
+<body>
+<div class="breadcrumb">{bc_html}</div>
+<h1>{title}</h1>
+{body}
+</body>
+</html>
+"""
+
+
+def _load_json(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# Level 4: Page index
+# ---------------------------------------------------------------------------
+
+def _generate_page_html(
+    page_dir: Path,
+    piece_id: str,
+    page_name: str,
+    page_data: dict,
+    breadcrumbs: list[tuple[str, str]],
+) -> None:
+    page_dir.mkdir(parents=True, exist_ok=True)
+    css_rel = _css_path(page_dir)
+
+    errors = page_data.get("errors", 0)
+    measures = page_data.get("measures", 0)
+    perfect = page_data.get("perfect", 0)
+
+    body_parts = []
+
+    body_parts.append(
+        '<div class="stats">'
+        + _stat(str(measures), "Measures")
+        + _stat(str(perfect), "Perfect")
+        + _stat(str(errors), "Errors")
+        + "</div>"
+    )
+
+    # Page image — link to source image in corpus/
+    page_img_rel = os.path.relpath(
+        DATA_DIR / "corpus" / piece_id / f"{page_name}.png", page_dir
+    )
+    body_parts.append(
+        '<h2>Page Image</h2>'
+        f'<div class="page-image">'
+        f'<a href="{page_img_rel}" target="_blank">'
+        f'<img src="{page_img_rel}" alt="{page_name}">'
+        f'</a></div>'
+    )
+
+    if errors == 0:
+        body_parts.append('<p class="no-errors">No errors on this page.</p>')
+    else:
+        body_parts.append(f'<p>{errors} measure-level errors on this page.</p>')
+
+    debug_dir = page_dir / "debug"
+    if debug_dir.is_dir():
+        debug_files = sorted(debug_dir.iterdir())
+        image_files = [f for f in debug_files if f.suffix.lower() in (".jpg", ".png", ".jpeg")]
+        if image_files:
+            body_parts.append("<h2>Debug Images</h2>")
+            body_parts.append('<div class="debug-images">')
+            for img in image_files:
+                rel = f"debug/{img.name}"
+                body_parts.append(
+                    f'<div class="debug-img">'
+                    f'<a href="{rel}" target="_blank"><img src="{rel}" loading="lazy"></a>'
+                    f'<div class="caption">{img.name}</div></div>'
+                )
+            body_parts.append("</div>")
+
+    crumbs = breadcrumbs + [(page_name, "")]
+    title = f"{piece_id} — {page_name}"
+    html = _html_page(title, crumbs, "\n".join(body_parts), css_rel)
+
+    with open(page_dir / "index.html", "w") as f:
+        f.write(html)
+
+
+# ---------------------------------------------------------------------------
+# Level 3: Piece index
+# ---------------------------------------------------------------------------
+
+def _generate_piece_html(
+    piece_dir: Path,
+    piece_id: str,
+    piece_data: dict,
+    breadcrumbs: list[tuple[str, str]],
+) -> None:
+    piece_dir.mkdir(parents=True, exist_ok=True)
+    css_rel = _css_path(piece_dir)
+
+    name = piece_data.get("name", piece_id)
+    ser = piece_data.get("ser", 0)
+    note_errors = piece_data.get("note_errors", piece_data.get("edit_distance", 0))
+    note_total = piece_data.get("note_total", piece_data.get("original_notes", 0))
+    perfect = piece_data.get("perfect_measures", 0)
+    total = piece_data.get("total_measures", 0)
+    error_breakdown = piece_data.get("note_error_breakdown", piece_data.get("errors", {}))
+    structural = piece_data.get("structural", {})
+    per_staff_ser = piece_data.get("per_staff_ser", {})
+    per_page = piece_data.get("per_page", {})
+
+    body_parts = []
+
+    ser_cls = _ser_class(ser)
+    body_parts.append(f'<div class="meta">{name}</div>')
+    body_parts.append(
+        '<div class="stats">'
+        + _stat(f"{ser}%", "SER", ser_cls)
+        + _stat(str(note_errors), "Note Errors")
+        + _stat(str(note_total), "GT Notes")
+        + _stat(f"{perfect}/{total}", "Perfect Measures")
+        + "</div>"
+    )
+
+    if per_staff_ser:
+        body_parts.append("<h3>Per-Staff SER</h3>")
+        body_parts.append("<table><tr><th>Staff</th><th>SER</th></tr>")
+        for staff, staff_ser in sorted(per_staff_ser.items()):
+            s_cls = _ser_class(int(staff_ser))
+            body_parts.append(
+                f'<tr><td>Staff {staff}</td>'
+                f'<td class="{s_cls}">{staff_ser}%</td></tr>'
+            )
+        body_parts.append("</table>")
+
+    if structural:
+        body_parts.append("<h2>Structural Accuracy</h2>")
+        body_parts.append(
+            "<table><tr><th>Element</th><th>Errors</th>"
+            "<th>Total</th><th>Accuracy</th></tr>"
+        )
+        for elem, sdata in sorted(structural.items()):
+            errs = sdata.get("errors", 0)
+            tot = sdata.get("total", 0)
+            acc = 100 - sdata.get("rate", 0)
+            acc_cls = _ser_class(sdata.get("rate", 0))
+            body_parts.append(
+                f'<tr><td>{elem}</td><td>{errs}</td>'
+                f'<td>{tot}</td><td class="{acc_cls}">{acc}%</td></tr>'
+            )
+        body_parts.append("</table>")
+
+    if error_breakdown:
+        total_errs = sum(error_breakdown.values())
+        body_parts.append("<h2>Note Error Breakdown</h2>")
+        body_parts.append("<table><tr><th>Category</th><th>Count</th><th>%</th></tr>")
+        for cat, cnt in sorted(error_breakdown.items(), key=lambda x: -x[1]):
+            pct = round(100 * cnt / total_errs) if total_errs > 0 else 0
+            body_parts.append(f"<tr><td>{cat}</td><td>{cnt}</td><td>{pct}%</td></tr>")
+        body_parts.append("</table>")
+
+    if per_page:
+        body_parts.append("<h2>Pages</h2>")
+        body_parts.append(
+            "<table><tr><th>Page</th><th>Measures</th><th>Perfect</th>"
+            "<th>Errors</th><th>Debug</th></tr>"
+        )
+        for page_file in sorted(per_page):
+            pp = per_page[page_file]
+            page_errors = pp.get("errors", 0)
+            page_measures = pp.get("measures", 0)
+            page_perfect = pp.get("perfect", 0)
+            page_stem = page_file.replace(".musicxml", "")
+            page_subdir = piece_dir / page_stem
+
+            has_debug = (page_subdir / "debug").is_dir()
+            debug_marker = "Yes" if has_debug else ""
+
+            body_parts.append(
+                f'<tr><td><a href="{page_stem}/index.html">{page_stem}</a></td>'
+                f"<td>{page_measures}</td>"
+                f"<td>{page_perfect}</td>"
+                f"<td>{page_errors}</td>"
+                f"<td>{debug_marker}</td></tr>"
+            )
+        body_parts.append("</table>")
+
+        for page_file in sorted(per_page):
+            page_stem = page_file.replace(".musicxml", "")
+            page_subdir = piece_dir / page_stem
+            page_crumbs = breadcrumbs + [(piece_id, "index.html")]
+            _generate_page_html(
+                page_subdir, piece_id, page_stem,
+                per_page[page_file], page_crumbs,
+            )
+
+    spot_dir = piece_dir / "spot"
+    if spot_dir.is_dir():
+        spot_links = sorted(spot_dir.iterdir())
+        if spot_links:
+            body_parts.append("<h2>Related Spot Checks</h2>")
+            body_parts.append("<ul>")
+            for link in spot_links:
+                body_parts.append(f'<li><a href="spot/{link.name}/index.html">{link.name}</a></li>')
+            body_parts.append("</ul>")
+
+    crumbs = breadcrumbs + [(piece_id, "")]
+    title = f"{piece_id}: {name}"
+    html = _html_page(title, crumbs, "\n".join(body_parts), css_rel)
+
+    with open(piece_dir / "index.html", "w") as f:
+        f.write(html)
+
+
+# ---------------------------------------------------------------------------
+# Level 2: Run index
+# ---------------------------------------------------------------------------
+
+def generate_run_html(run_dir: Path, is_spot: bool = False) -> None:
+    results = _load_json(run_dir / "results.json")
+    if results is None:
+        diag = _load_json(run_dir / "diagnosis.json")
+        if diag is None:
+            return
+        _generate_spot_piece_html(run_dir, diag)
+        return
+
+    if is_spot:
+        # Spot checks have one piece — generate piece HTML as the index
+        pieces = results.get("pieces", {})
+        if pieces:
+            pid = next(iter(pieces))
+            diag = _load_json(run_dir / "diagnosis.json")
+            data = diag if diag else pieces[pid]
+            spot_index_rel = os.path.relpath(DATA_DIR / "spot" / "index.html", run_dir)
+            crumbs = [("All Spot Checks", spot_index_rel), (pid, "")]
+            _generate_piece_html(run_dir, pid, data, crumbs)
+        return
+
+    css_rel = _css_path(run_dir)
+    effort = results.get("effort", "?")
+    commit = results.get("git_commit", "?")
+    o = results.get("overall", {})
+    pieces = results.get("pieces", {})
+
+    body_parts = []
+
+    git_branch = results.get("git_branch", "?")
+    timestamp = results.get("timestamp", "?")
+    body_parts.append(
+        '<div class="meta">'
+        f"Branch: {git_branch} | Commit: {commit}"
+        f" | Date: {timestamp}"
+        "</div>"
+    )
+
+    avg_ser = o.get("avg_ser", 0)
+    overall_ser = o.get("overall_ser", 0)
+    ser_cls = _ser_class(avg_ser)
+    note_errs_str = f"{o.get('note_errors', o.get('total_errors', 0)):,}"
+    note_total_str = f"{o.get('note_total', 0):,}"
+    body_parts.append(
+        '<div class="stats">'
+        + _stat(f"{avg_ser}%", "Avg SER", ser_cls)
+        + _stat(f"{overall_ser}%", "Overall SER")
+        + _stat(note_errs_str, "Note Errors")
+        + _stat(note_total_str, "GT Notes")
+        + _stat(str(o.get("pieces", 0)), "Pieces")
+        + _stat(f"{o.get('perfect_measures_pct', 0)}%", "Perfect Measures")
+        + "</div>"
+    )
+
+    # Structural accuracy
+    structural = o.get("structural", {})
+    if structural:
+        body_parts.append("<h2>Structural Accuracy</h2>")
+        body_parts.append(
+            "<table><tr><th>Element</th><th>Errors</th>"
+            "<th>Total</th><th>Error Rate</th></tr>"
+        )
+        for elem in sorted(structural):
+            sdata = structural[elem]
+            errs = sdata.get("errors", 0)
+            tot = sdata.get("total", 0)
+            rate = sdata.get("rate", 0)
+            rate_cls = _ser_class(rate)
+            body_parts.append(
+                f'<tr><td>{elem}</td><td>{errs:,}</td>'
+                f'<td>{tot:,}</td><td class="{rate_cls}">{rate}%</td></tr>'
+            )
+        body_parts.append("</table>")
+
+    by_cat = o.get("note_error_breakdown", o.get("by_category", {}))
+    if by_cat:
+        total_errs = sum(by_cat.values())
+        body_parts.append("<h2>Note Error Breakdown</h2>")
+        body_parts.append("<table><tr><th>Category</th><th>Count</th><th>%</th></tr>")
+        for cat, cnt in sorted(by_cat.items(), key=lambda x: -x[1]):
+            pct = round(100 * cnt / total_errs) if total_errs > 0 else 0
+            body_parts.append(f"<tr><td>{cat}</td><td>{cnt:,}</td><td>{pct}%</td></tr>")
+        body_parts.append("</table>")
+
+    if pieces:
+        body_parts.append("<h2>Pieces</h2>")
+        body_parts.append(
+            "<table><tr><th>Piece</th><th>Name</th><th>SER</th>"
+            "<th>Note Errors</th><th>GT Notes</th><th>Perfect</th></tr>"
+        )
+        for pid, pdata in sorted(pieces.items(), key=lambda x: -x[1].get("ser", 0)):
+            p_ser = pdata.get("ser", 0)
+            p_cls = _ser_class(p_ser)
+            pm = pdata.get("perfect_measures", 0)
+            tm = pdata.get("total_measures", 0)
+            n_err = pdata.get("note_errors", pdata.get("edit_distance", 0))
+            n_tot = pdata.get("note_total", pdata.get("original_notes", 0))
+            body_parts.append(
+                f'<tr><td><a href="{pid}/index.html">{pid}</a></td>'
+                f'<td>{pdata.get("name", "")}</td>'
+                f'<td class="{p_cls}">{p_ser}%</td>'
+                f'<td>{n_err}</td>'
+                f'<td>{n_tot}</td>'
+                f"<td>{pm}/{tm}</td></tr>"
+            )
+        body_parts.append("</table>")
+
+    runs_index_rel = os.path.relpath(DATA_DIR / "runs" / "index.html", run_dir)
+    crumbs = [("All Runs", runs_index_rel), (f"{effort}/{commit}", "")]
+    title = f"{effort} / {commit}"
+    html = _html_page(title, crumbs, "\n".join(body_parts), css_rel)
+
+    with open(run_dir / "index.html", "w") as f:
+        f.write(html)
+
+    for pid, pdata in pieces.items():
+        piece_dir = run_dir / pid
+        if piece_dir.is_dir():
+            diag = _load_json(piece_dir / "diagnosis.json")
+            data = diag if diag else pdata
+            piece_crumbs = [("All Runs", runs_index_rel), (f"{effort}/{commit}", "index.html")]
+            _generate_piece_html(piece_dir, pid, data, piece_crumbs)
+
+
+def _generate_spot_piece_html(spot_dir: Path, diag: dict) -> None:
+    piece_id = "unknown"
+    for part in spot_dir.parts:
+        if part.startswith("piece-"):
+            piece_id = part
+            break
+
+    spot_index_rel = os.path.relpath(DATA_DIR / "spot" / "index.html", spot_dir)
+    crumbs = [("All Spot Checks", spot_index_rel), (piece_id, "")]
+    _generate_piece_html(spot_dir, piece_id, diag, crumbs)
+
+
+# ---------------------------------------------------------------------------
+# Level 1: All-runs index
+# ---------------------------------------------------------------------------
+
+def _scan_efforts(runs_dir: Path) -> dict[str, list[dict]]:
+    efforts: dict[str, list[dict]] = {}
+    if not runs_dir.is_dir():
+        return efforts
+
+    for entry in sorted(runs_dir.iterdir()):
+        if not entry.is_dir() or entry.is_symlink() or entry.name == "index.html":
+            continue
+
+        sub_runs = []
+        for sub in sorted(entry.iterdir()):
+            if not sub.is_dir() or sub.is_symlink():
+                continue
+            results = _load_json(sub / "results.json")
+            if results:
+                sub_runs.append({
+                    "path": sub,
+                    "dir_name": sub.name,
+                    "results": results,
+                })
+
+        if sub_runs:
+            efforts[entry.name] = sub_runs
+        else:
+            results = _load_json(entry / "results.json")
+            if results:
+                effort_name = "legacy"
+                if effort_name not in efforts:
+                    efforts[effort_name] = []
+                efforts[effort_name].append({
+                    "path": entry,
+                    "dir_name": entry.name,
+                    "results": results,
+                })
+
+    return efforts
+
+
+def _generate_runs_index(runs_dir: Path) -> None:
+    efforts = _scan_efforts(runs_dir)
+    css_rel = _css_path(runs_dir)
+
+    body_parts = []
+
+    spot_index = DATA_DIR / "spot" / "index.html"
+    if spot_index.exists():
+        spot_rel = os.path.relpath(spot_index, runs_dir)
+        body_parts.append(f'<p><a href="{spot_rel}">View Spot Checks</a></p>')
+
+    for effort_name in sorted(efforts):
+        runs = efforts[effort_name]
+        body_parts.append('<div class="effort-group">')
+        body_parts.append(f'<div class="effort-header">{effort_name}</div>')
+        body_parts.append(
+            "<table><tr><th>Run</th><th>Avg SER</th><th>Note Errors</th>"
+            "<th>Pieces</th><th>Perfect%</th><th>Date</th></tr>"
+        )
+        for run_info in reversed(runs):
+            r = run_info["results"]
+            o = r.get("overall", {})
+            avg_ser = o.get("avg_ser", 0)
+            ser_cls = _ser_class(avg_ser)
+            run_rel = os.path.relpath(run_info["path"], runs_dir)
+            label = r.get("git_commit", run_info["dir_name"])
+            n_err = o.get("note_errors", o.get("total_errors", 0))
+            body_parts.append(
+                f'<tr><td><a href="{run_rel}/index.html">{label}</a></td>'
+                f'<td class="{ser_cls}">{avg_ser}%</td>'
+                f'<td>{n_err:,}</td>'
+                f'<td>{o.get("pieces", 0)}</td>'
+                f'<td>{o.get("perfect_measures_pct", 0)}%</td>'
+                f'<td>{r.get("timestamp", "?")}</td></tr>'
+            )
+        body_parts.append("</table></div>")
+
+    if not efforts:
+        body_parts.append("<p>No evaluation runs found.</p>")
+
+    crumbs = [("All Runs", "")]
+    html = _html_page("Evaluation Runs", crumbs, "\n".join(body_parts), css_rel)
+
+    with open(runs_dir / "index.html", "w") as f:
+        f.write(html)
+
+
+# ---------------------------------------------------------------------------
+# Spot checks index
+# ---------------------------------------------------------------------------
+
+def _generate_spot_index() -> None:
+    spot_dir = DATA_DIR / "spot"
+    if not spot_dir.is_dir():
+        return
+
+    css_rel = _css_path(spot_dir)
+    body_parts = []
+
+    runs_index_rel = os.path.relpath(DATA_DIR / "runs" / "index.html", spot_dir)
+    body_parts.append(f'<p><a href="{runs_index_rel}">View Full Runs</a></p>')
+
+    piece_dirs = sorted(
+        d for d in spot_dir.iterdir()
+        if d.is_dir() and d.name.startswith("piece-")
+    )
+
+    for piece_dir in piece_dirs:
+        piece_id = piece_dir.name
+        body_parts.append('<div class="effort-group">')
+        body_parts.append(f'<div class="effort-header">{piece_id}</div>')
+
+        effort_dirs = sorted(
+            d for d in piece_dir.iterdir()
+            if d.is_dir() and d.name != "runs"
+        )
+
+        if effort_dirs:
+            body_parts.append(
+                "<table><tr><th>Effort</th><th>Run</th><th>SER</th></tr>"
+            )
+            for effort_dir in effort_dirs:
+                effort_name = effort_dir.name
+                run_dirs = sorted(
+                    d for d in effort_dir.iterdir()
+                    if d.is_dir() and not d.is_symlink()
+                )
+                for rd in run_dirs:
+                    diag = _load_json(rd / "diagnosis.json")
+                    ser = diag.get("ser", "?") if diag else "?"
+                    ser_cls = _ser_class(int(ser)) if isinstance(ser, int) else ""
+                    rd_rel = os.path.relpath(rd, spot_dir)
+                    body_parts.append(
+                        f'<tr><td>{effort_name}</td>'
+                        f'<td><a href="{rd_rel}/index.html">{rd.name}</a></td>'
+                        f'<td class="{ser_cls}">{ser}%</td></tr>'
+                    )
+            body_parts.append("</table>")
+
+        body_parts.append("</div>")
+
+    if not piece_dirs:
+        body_parts.append("<p>No spot checks found.</p>")
+
+    crumbs = [("All Spot Checks", "")]
+    html = _html_page("Spot Checks", crumbs, "\n".join(body_parts), css_rel)
+
+    with open(spot_dir / "index.html", "w") as f:
+        f.write(html)
+
+    # Generate HTML for each individual spot run
+    for piece_dir in piece_dirs:
+        for effort_dir in piece_dir.iterdir():
+            if not effort_dir.is_dir():
+                continue
+            for rd in effort_dir.iterdir():
+                if rd.is_dir() and not rd.is_symlink():
+                    generate_run_html(rd, is_spot=True)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def generate_all_html() -> None:
+    """Regenerate all HTML: top-level indices + all run/spot directories."""
+    with open(DATA_DIR / STYLE_CSS, "w") as f:
+        f.write(CSS)
+
+    runs_dir = DATA_DIR / "runs"
+    if runs_dir.is_dir():
+        _generate_runs_index(runs_dir)
+
+    _generate_spot_index()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Generate evaluation HTML reports")
+    parser.add_argument("--run", type=str, help="Generate HTML for a specific run directory")
+    args = parser.parse_args()
+
+    if args.run:
+        run_dir = Path(args.run)
+        if not run_dir.is_dir():
+            print(f"ERROR: {run_dir} is not a directory", file=sys.stderr)
+            sys.exit(1)
+        with open(DATA_DIR / STYLE_CSS, "w") as f:
+            f.write(CSS)
+        generate_run_html(run_dir)
+
+    generate_all_html()
+    print(f"HTML generated. Open: {DATA_DIR / 'runs' / 'index.html'}")
+
+
+if __name__ == "__main__":
+    main()

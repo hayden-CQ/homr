@@ -1,0 +1,40 @@
+# OMR Improvement Pipeline - Design Discussion
+
+**Status:** Early Planning
+**Created:** 2026-03-19
+**Participants:** Human + Claude
+
+## Open Discussion Topics
+
+| # | Topic | Status | Notes |
+|---|-------|--------|-------|
+| 1 | Core Requirements | Queued | What does the improvement loop look like? What are we optimizing? |
+| 2 | Agent Roles & Strengths | Queued | Claude vs Codex vs Gemini — who does what? |
+| 3 | Research/Hypothesis Loop | Queued | How do we identify, test, and validate improvement theories? |
+| 4 | Eval Integration | Queued | How agents interact with the eval infrastructure |
+| 5 | Human Touchpoints | Queued | Where does the human decide vs where is it autonomous? |
+| 6 | Failure Categories | Queued | Taxonomy of what's wrong — crop, model, post-processing, etc. |
+| 7 | Implementation Order | Queued | What do we build first? |
+
+## Decisions Made
+
+_None yet_
+
+## AC Candidates
+
+_Breadcrumbs collected during discussion._
+
+## Parking Lot
+
+- Specific fixes: staff crop validation, bass hallucination, geometric bass correction
+- Model retraining (out of scope for now?)
+- Training data improvements
+
+## Session Log
+
+### 2026-03-19
+- Session started
+- Context: We have v2 eval infrastructure, 69-piece corpus, debug image pipeline
+- staffdet+287 is current best (29% avg SER), but 18 pieces regressed from main
+- Known failure categories: crop failures, model hallucinations, pitch shifts, dewarping artifacts
+- User wants a multi-agent research loop (Claude + Codex + possibly Gemini) for systematically improving output quality

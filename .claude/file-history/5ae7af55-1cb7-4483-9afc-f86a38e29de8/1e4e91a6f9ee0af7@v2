@@ -1,0 +1,971 @@
+"""
+MusicXML diagnostic comparison — v2: flat sequence SER + structural metrics.
+
+Compares ground truth and output MusicXML with:
+- Flat per-staff note sequence comparison (primary SER, measure-boundary-agnostic)
+- Structural accuracy: key signatures, time signatures, clefs, ties, slurs,
+  grace notes, articulations, repeats
+- Positional measure comparison (diagnostic, not headline metric)
+
+Usage:
+    python scripts/diagnose_musicxml_v2.py <ground_truth.xml> <output.musicxml>
+"""
+
+import sys
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from difflib import SequenceMatcher
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+@dataclass
+class NoteEvent:
+    """A single note/rest in the flat sequence."""
+    pitch: str       # "C4", "D#5", "rest"
+    note_type: str   # "quarter", "eighth.", "half.."
+    staff: int
+    is_chord: bool = False
+    is_grace: bool = False
+    tie_start: bool = False
+    tie_stop: bool = False
+    slur_starts: list[int] = field(default_factory=list)  # slur numbers
+    slur_stops: list[int] = field(default_factory=list)
+    articulations: list[str] = field(default_factory=list)  # ["staccato", "accent", ...]
+    measure_index: int = 0  # positional index (not measure number)
+
+    def note_key(self) -> str:
+        """Key for note comparison: pitch + rhythm."""
+        return f"{self.pitch}:{self.note_type}"
+
+
+@dataclass
+class MeasureInfo:
+    """Extracted info for one measure."""
+    measure_num: int        # original number from XML
+    position_index: int     # 0-based positional index
+    notes: list[NoteEvent] = field(default_factory=list)
+
+
+@dataclass
+class KeyChange:
+    """Key signature change at a position."""
+    measure_index: int
+    fifths: int
+
+    def key(self) -> str:
+        return f"key:{self.fifths}"
+
+
+@dataclass
+class TimeChange:
+    """Time signature change at a position."""
+    measure_index: int
+    beats: str
+    beat_type: str
+
+    def key(self) -> str:
+        return f"time:{self.beats}/{self.beat_type}"
+
+
+@dataclass
+class ClefChange:
+    """Clef change at a position."""
+    measure_index: int
+    staff: int
+    sign: str
+    line: str
+
+    def key(self) -> str:
+        return f"clef:s{self.staff}:{self.sign}{self.line}"
+
+
+@dataclass
+class RepeatMark:
+    """Repeat barline."""
+    measure_index: int
+    direction: str  # "forward" or "backward"
+
+    def key(self) -> str:
+        return f"repeat:{self.direction}"
+
+
+@dataclass
+class MetricResult:
+    """Result for a single accuracy metric."""
+    name: str
+    errors: int
+    total: int
+    details: list[str] = field(default_factory=list)
+
+    @property
+    def rate(self) -> float:
+        if self.total == 0:
+            return 0.0
+        return self.errors / self.total
+
+    @property
+    def pct(self) -> int:
+        return round(100 * self.rate)
+
+
+@dataclass
+class NoteError:
+    """A single note-level error from flat comparison."""
+    staff: int
+    category: str      # "missing", "extra", "replace"
+    gt_key: str        # e.g. "C4:quarter" or "" for extra
+    out_key: str       # e.g. "C4:quarter" or "" for missing
+    position: int      # index in the sequence
+    sub_category: str = ""  # "octave", "rhythm", "step", etc.
+
+
+@dataclass
+class MeasureDiagnostic:
+    """Per-measure diagnostic info."""
+    position_index: int
+    gt_measure_num: int | None
+    out_measure_num: int | None
+    is_perfect: bool
+    staff_errors: dict[int, list[str]] = field(default_factory=dict)
+
+
+@dataclass
+class DiagnosisResult:
+    """Full diagnosis output."""
+    # Headline: flat note SER per staff
+    note_ser: MetricResult
+    note_ser_by_staff: dict[int, MetricResult] = field(default_factory=dict)
+    note_errors: list[NoteError] = field(default_factory=list)
+
+    # Structural metrics
+    key_accuracy: MetricResult = field(default_factory=lambda: MetricResult("key_signatures", 0, 0))
+    time_accuracy: MetricResult = field(default_factory=lambda: MetricResult("time_signatures", 0, 0))
+    clef_accuracy: MetricResult = field(default_factory=lambda: MetricResult("clefs", 0, 0))
+    tie_accuracy: MetricResult = field(default_factory=lambda: MetricResult("ties", 0, 0))
+    slur_accuracy: MetricResult = field(default_factory=lambda: MetricResult("slurs", 0, 0))
+    grace_accuracy: MetricResult = field(default_factory=lambda: MetricResult("grace_notes", 0, 0))
+    articulation_accuracy: MetricResult = field(default_factory=lambda: MetricResult("articulations", 0, 0))
+    repeat_accuracy: MetricResult = field(default_factory=lambda: MetricResult("repeats", 0, 0))
+
+    # Measure diagnostics
+    measure_count_gt: int = 0
+    measure_count_out: int = 0
+    perfect_measures: int = 0
+    total_measures_compared: int = 0
+    measure_diagnostics: list[MeasureDiagnostic] = field(default_factory=list)
+
+    # Duration check (carried over from v1 for compatibility)
+    duration_check: dict[str, int] = field(default_factory=lambda: {"ok": 0, "underfull": 0, "overfull": 0})
+
+
+# ---------------------------------------------------------------------------
+# Pitch utilities (reused from v1)
+# ---------------------------------------------------------------------------
+
+_NOTE_SEMITONES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+_ACC_SEMITONES = {"": 0, "#": 1, "b": -1, "##": 2, "bb": -2}
+
+
+def _parse_pitch(pitch_elem: ET.Element, ns: str) -> str:
+    step = pitch_elem.find(f"{ns}step")
+    octave = pitch_elem.find(f"{ns}octave")
+    alter = pitch_elem.find(f"{ns}alter")
+    step_text = step.text if step is not None else "?"
+    octave_text = octave.text if octave is not None else "?"
+    alter_text = ""
+    if alter is not None:
+        a = int(float(alter.text))  # type: ignore[arg-type]
+        if a == 1:
+            alter_text = "#"
+        elif a == -1:
+            alter_text = "b"
+        elif a == 2:
+            alter_text = "##"
+        elif a == -2:
+            alter_text = "bb"
+    return f"{step_text}{alter_text}{octave_text}"
+
+
+def _split_pitch(pitch_str: str) -> tuple[str, str, str]:
+    if pitch_str == "rest":
+        return ("rest", "", "")
+    letter = pitch_str[0]
+    rest = pitch_str[1:]
+    accidental = ""
+    for acc in ("##", "bb", "#", "b"):
+        if rest.startswith(acc):
+            accidental = acc
+            rest = rest[len(acc):]
+            break
+    return (letter, accidental, rest)
+
+
+def _pitch_to_midi(pitch_str: str) -> int | None:
+    if pitch_str == "rest":
+        return None
+    letter, acc, octave = _split_pitch(pitch_str)
+    if letter not in _NOTE_SEMITONES or octave == "" or not octave.isdigit():
+        return None
+    return int(octave) * 12 + _NOTE_SEMITONES[letter] + _ACC_SEMITONES.get(acc, 0)
+
+
+def classify_substitution(gt_pitch: str, out_pitch: str, gt_type: str, out_type: str) -> str:
+    """Classify a note substitution into a category."""
+    pitch_same = gt_pitch == out_pitch
+    type_same = gt_type == out_type
+
+    if pitch_same:
+        return "match" if type_same else "rhythm"
+
+    gt_letter, gt_acc, gt_oct = _split_pitch(gt_pitch)
+    out_letter, out_acc, out_oct = _split_pitch(out_pitch)
+
+    if gt_pitch == "rest" or out_pitch == "rest":
+        return "rest_note_swap"
+
+    if gt_letter == out_letter:
+        if gt_acc == out_acc and gt_oct != out_oct:
+            return "octave"
+        if gt_oct == out_oct and gt_acc != out_acc:
+            gt_midi = _pitch_to_midi(gt_pitch)
+            out_midi = _pitch_to_midi(out_pitch)
+            if gt_midi is not None and out_midi is not None and gt_midi == out_midi:
+                return "enharmonic"
+            return "accidental"
+
+    gt_midi = _pitch_to_midi(gt_pitch)
+    out_midi = _pitch_to_midi(out_pitch)
+    if gt_midi is not None and out_midi is not None and abs(gt_midi - out_midi) <= 2:
+        return "step"
+    if gt_midi is not None and out_midi is not None and abs(gt_midi - out_midi) >= 12:
+        return "cross_staff"
+
+    return "far_pitch"
+
+
+# ---------------------------------------------------------------------------
+# Extraction
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ParsedXml:
+    """Everything extracted from one MusicXML file."""
+    measures: list[MeasureInfo]
+    notes: list[NoteEvent]          # flat, in document order, non-grace
+    grace_notes: list[NoteEvent]    # grace notes separately
+    key_changes: list[KeyChange]
+    time_changes: list[TimeChange]
+    clef_changes: list[ClefChange]
+    repeats: list[RepeatMark]
+
+
+def extract_all(xml_path: str) -> ParsedXml:
+    """Extract all musical elements from a MusicXML file."""
+    tree = ET.parse(xml_path)  # noqa: S314
+    root = tree.getroot()
+
+    ns = ""
+    if root.tag.startswith("{"):
+        ns = root.tag.split("}")[0] + "}"
+
+    measures: list[MeasureInfo] = []
+    all_notes: list[NoteEvent] = []
+    all_graces: list[NoteEvent] = []
+    key_changes: list[KeyChange] = []
+    time_changes: list[TimeChange] = []
+    clef_changes: list[ClefChange] = []
+    repeats: list[RepeatMark] = []
+
+    measure_index = 0
+
+    for part in root.iter(f"{ns}part"):
+        for measure_elem in part.iter(f"{ns}measure"):
+            num_str = measure_elem.get("number", "0")
+            try:
+                num = int(num_str)
+            except ValueError:
+                num = int("".join(c for c in num_str if c.isdigit()) or "0")
+
+            m_info = MeasureInfo(
+                measure_num=num,
+                position_index=measure_index,
+            )
+
+            # --- Attributes: key, time, clef ---
+            for attributes in measure_elem.findall(f"{ns}attributes"):
+                key_elem = attributes.find(f"{ns}key")
+                if key_elem is not None:
+                    fifths_el = key_elem.find(f"{ns}fifths")
+                    if fifths_el is not None and fifths_el.text:
+                        key_changes.append(KeyChange(
+                            measure_index=measure_index,
+                            fifths=int(fifths_el.text),
+                        ))
+
+                time_elem = attributes.find(f"{ns}time")
+                if time_elem is not None:
+                    beats_el = time_elem.find(f"{ns}beats")
+                    bt_el = time_elem.find(f"{ns}beat-type")
+                    if (beats_el is not None and beats_el.text
+                            and bt_el is not None and bt_el.text):
+                        time_changes.append(TimeChange(
+                            measure_index=measure_index,
+                            beats=beats_el.text,
+                            beat_type=bt_el.text,
+                        ))
+
+                for clef_elem in attributes.findall(f"{ns}clef"):
+                    sign_el = clef_elem.find(f"{ns}sign")
+                    line_el = clef_elem.find(f"{ns}line")
+                    staff_num = int(clef_elem.get("number", "1"))
+                    if sign_el is not None and line_el is not None:
+                        clef_changes.append(ClefChange(
+                            measure_index=measure_index,
+                            staff=staff_num,
+                            sign=sign_el.text or "?",
+                            line=line_el.text or "?",
+                        ))
+
+            # --- Barlines: repeats ---
+            for barline in measure_elem.findall(f"{ns}barline"):
+                repeat_el = barline.find(f"{ns}repeat")
+                if repeat_el is not None:
+                    direction = repeat_el.get("direction", "unknown")
+                    repeats.append(RepeatMark(
+                        measure_index=measure_index,
+                        direction=direction,
+                    ))
+
+            # --- Notes ---
+            for note_elem in measure_elem.iter(f"{ns}note"):
+                # Pitch or rest
+                is_rest = note_elem.find(f"{ns}rest") is not None
+                is_grace = note_elem.find(f"{ns}grace") is not None
+                is_chord = note_elem.find(f"{ns}chord") is not None
+
+                if is_rest:
+                    pitch = "rest"
+                else:
+                    pitch_elem = note_elem.find(f"{ns}pitch")
+                    if pitch_elem is not None:
+                        pitch = _parse_pitch(pitch_elem, ns)
+                    else:
+                        continue
+
+                # Note type + dots
+                type_elem = note_elem.find(f"{ns}type")
+                note_type = type_elem.text if type_elem is not None and type_elem.text else "?"
+                dots = len(note_elem.findall(f"{ns}dot"))
+                if dots == 1:
+                    note_type += "."
+                elif dots == 2:
+                    note_type += ".."
+
+                # Staff
+                staff_elem = note_elem.find(f"{ns}staff")
+                staff_num = int(staff_elem.text) if staff_elem is not None and staff_elem.text else 1
+
+                # Tie
+                tie_start = False
+                tie_stop = False
+                for tie_el in note_elem.findall(f"{ns}tie"):
+                    if tie_el.get("type") == "start":
+                        tie_start = True
+                    elif tie_el.get("type") == "stop":
+                        tie_stop = True
+
+                # Notations: slurs, articulations
+                slur_starts: list[int] = []
+                slur_stops: list[int] = []
+                artics: list[str] = []
+
+                notations = note_elem.find(f"{ns}notations")
+                if notations is not None:
+                    for slur_el in notations.findall(f"{ns}slur"):
+                        stype = slur_el.get("type")
+                        snum = int(slur_el.get("number", "1"))
+                        if stype == "start":
+                            slur_starts.append(snum)
+                        elif stype == "stop":
+                            slur_stops.append(snum)
+
+                    artic_el = notations.find(f"{ns}articulations")
+                    if artic_el is not None:
+                        for a in artic_el:
+                            tag = a.tag
+                            if ns and tag.startswith(ns):
+                                tag = tag[len(ns):]
+                            artics.append(tag)
+
+                event = NoteEvent(
+                    pitch=pitch,
+                    note_type=note_type,
+                    staff=staff_num,
+                    is_chord=is_chord,
+                    is_grace=is_grace,
+                    tie_start=tie_start,
+                    tie_stop=tie_stop,
+                    slur_starts=slur_starts,
+                    slur_stops=slur_stops,
+                    articulations=artics,
+                    measure_index=measure_index,
+                )
+
+                m_info.notes.append(event)
+                if is_grace:
+                    all_graces.append(event)
+                else:
+                    all_notes.append(event)
+
+            measures.append(m_info)
+            measure_index += 1
+
+        break  # first part only
+
+    return ParsedXml(
+        measures=measures,
+        notes=all_notes,
+        grace_notes=all_graces,
+        key_changes=key_changes,
+        time_changes=time_changes,
+        clef_changes=clef_changes,
+        repeats=repeats,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Comparison functions
+# ---------------------------------------------------------------------------
+
+def _compare_flat_notes(
+    gt_notes: list[NoteEvent],
+    out_notes: list[NoteEvent],
+) -> tuple[MetricResult, dict[int, MetricResult], list[NoteError]]:
+    """Compare flat note sequences per staff. Returns overall + per-staff results + errors."""
+    # Collect staves
+    staves = sorted(set(n.staff for n in gt_notes) | set(n.staff for n in out_notes))
+
+    all_errors: list[NoteError] = []
+    total_gt = 0
+    total_errors = 0
+    per_staff: dict[int, MetricResult] = {}
+
+    for staff in staves:
+        gt_keys = [n.note_key() for n in gt_notes if n.staff == staff]
+        out_keys = [n.note_key() for n in out_notes if n.staff == staff]
+
+        matcher = SequenceMatcher(None, gt_keys, out_keys)
+        staff_errors = 0
+        staff_details: list[str] = []
+
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == "equal":
+                continue
+            elif tag == "replace":
+                gt_span = gt_keys[i1:i2]
+                out_span = out_keys[j1:j2]
+                for k in range(max(len(gt_span), len(out_span))):
+                    if k < len(gt_span) and k < len(out_span):
+                        gp, gt_ = gt_span[k].split(":")
+                        op, ot = out_span[k].split(":")
+                        sub_cat = classify_substitution(gp, op, gt_, ot)
+                        all_errors.append(NoteError(
+                            staff=staff, category="replace",
+                            gt_key=gt_span[k], out_key=out_span[k],
+                            position=i1 + k, sub_category=sub_cat,
+                        ))
+                        staff_details.append(f"replace@{i1+k}: {gt_span[k]} -> {out_span[k]} ({sub_cat})")
+                        staff_errors += 1
+                    elif k < len(gt_span):
+                        all_errors.append(NoteError(
+                            staff=staff, category="missing",
+                            gt_key=gt_span[k], out_key="",
+                            position=i1 + k,
+                        ))
+                        staff_details.append(f"missing@{i1+k}: {gt_span[k]}")
+                        staff_errors += 1
+                    else:
+                        all_errors.append(NoteError(
+                            staff=staff, category="extra",
+                            gt_key="", out_key=out_span[k],
+                            position=j1 + k,
+                        ))
+                        staff_details.append(f"extra@{j1+k}: {out_span[k]}")
+                        staff_errors += 1
+            elif tag == "delete":
+                for k in range(i1, i2):
+                    all_errors.append(NoteError(
+                        staff=staff, category="missing",
+                        gt_key=gt_keys[k], out_key="",
+                        position=k,
+                    ))
+                    staff_details.append(f"missing@{k}: {gt_keys[k]}")
+                    staff_errors += 1
+            elif tag == "insert":
+                for k in range(j1, j2):
+                    all_errors.append(NoteError(
+                        staff=staff, category="extra",
+                        gt_key="", out_key=out_keys[k],
+                        position=k,
+                    ))
+                    staff_details.append(f"extra@{k}: {out_keys[k]}")
+                    staff_errors += 1
+
+        per_staff[staff] = MetricResult(
+            name=f"note_ser_staff_{staff}",
+            errors=staff_errors,
+            total=len(gt_keys),
+            details=staff_details,
+        )
+        total_gt += len(gt_keys)
+        total_errors += staff_errors
+
+    overall = MetricResult(
+        name="note_ser",
+        errors=total_errors,
+        total=total_gt,
+    )
+    return overall, per_staff, all_errors
+
+
+def _compare_sequences(name: str, gt_keys: list[str], out_keys: list[str]) -> MetricResult:
+    """Generic sequence comparison using SequenceMatcher."""
+    if gt_keys == out_keys:
+        return MetricResult(name=name, errors=0, total=len(gt_keys))
+
+    matcher = SequenceMatcher(None, gt_keys, out_keys)
+    errors = 0
+    details: list[str] = []
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        elif tag == "replace":
+            gt_span = gt_keys[i1:i2]
+            out_span = out_keys[j1:j2]
+            count = max(len(gt_span), len(out_span))
+            errors += count
+            details.append(f"replace@{i1}: {gt_span} -> {out_span}")
+        elif tag == "delete":
+            count = i2 - i1
+            errors += count
+            details.append(f"missing@{i1}: {gt_keys[i1:i2]}")
+        elif tag == "insert":
+            count = j2 - j1
+            errors += count
+            details.append(f"extra@{j1}: {out_keys[j1:j2]}")
+
+    return MetricResult(name=name, errors=errors, total=max(len(gt_keys), len(out_keys)), details=details)
+
+
+def _compare_ties(gt_notes: list[NoteEvent], out_notes: list[NoteEvent]) -> MetricResult:
+    """Compare tie placement using (pitch, staff, sequence_position)."""
+    def _tie_keys(notes: list[NoteEvent]) -> list[str]:
+        # Build per-staff index
+        staff_counters: dict[int, int] = {}
+        keys: list[str] = []
+        for n in notes:
+            if n.staff not in staff_counters:
+                staff_counters[n.staff] = 0
+            idx = staff_counters[n.staff]
+            if n.tie_start:
+                keys.append(f"tie:s{n.staff}:{n.pitch}@{idx}")
+            staff_counters[n.staff] = idx + 1
+        return keys
+
+    gt_keys = _tie_keys(gt_notes)
+    out_keys = _tie_keys(out_notes)
+    return _compare_sequences("ties", gt_keys, out_keys)
+
+
+def _compare_slurs(gt_notes: list[NoteEvent], out_notes: list[NoteEvent]) -> MetricResult:
+    """Compare slur placement using (staff, start_position, end_position)."""
+    def _slur_keys(notes: list[NoteEvent]) -> list[str]:
+        # Track open slurs: {(staff, slur_number): start_index}
+        open_slurs: dict[tuple[int, int], int] = {}
+        staff_counters: dict[int, int] = {}
+        keys: list[str] = []
+
+        for n in notes:
+            if n.staff not in staff_counters:
+                staff_counters[n.staff] = 0
+            idx = staff_counters[n.staff]
+
+            for snum in n.slur_starts:
+                open_slurs[(n.staff, snum)] = idx
+            for snum in n.slur_stops:
+                start_key = (n.staff, snum)
+                start_idx = open_slurs.pop(start_key, -1)
+                keys.append(f"slur:s{n.staff}:{start_idx}-{idx}")
+
+            staff_counters[n.staff] = idx + 1
+
+        return sorted(keys)
+
+    gt_keys = _slur_keys(gt_notes)
+    out_keys = _slur_keys(out_notes)
+    return _compare_sequences("slurs", gt_keys, out_keys)
+
+
+def _compare_graces(gt_graces: list[NoteEvent], out_graces: list[NoteEvent]) -> MetricResult:
+    """Compare grace notes by (pitch, staff, measure_index)."""
+    def _grace_keys(graces: list[NoteEvent]) -> list[str]:
+        return [f"grace:s{g.staff}:{g.pitch}:{g.note_type}@m{g.measure_index}" for g in graces]
+
+    gt_keys = _grace_keys(gt_graces)
+    out_keys = _grace_keys(out_graces)
+    return _compare_sequences("grace_notes", gt_keys, out_keys)
+
+
+def _compare_articulations(gt_notes: list[NoteEvent], out_notes: list[NoteEvent]) -> MetricResult:
+    """Compare articulations by (type, staff, note_index)."""
+    def _artic_keys(notes: list[NoteEvent]) -> list[str]:
+        staff_counters: dict[int, int] = {}
+        keys: list[str] = []
+        for n in notes:
+            if n.staff not in staff_counters:
+                staff_counters[n.staff] = 0
+            idx = staff_counters[n.staff]
+            for a in n.articulations:
+                keys.append(f"artic:s{n.staff}:{a}@{idx}")
+            staff_counters[n.staff] = idx + 1
+        return keys
+
+    gt_keys = _artic_keys(gt_notes)
+    out_keys = _artic_keys(out_notes)
+    return _compare_sequences("articulations", gt_keys, out_keys)
+
+
+def _compare_measures_positional(
+    gt_measures: list[MeasureInfo],
+    out_measures: list[MeasureInfo],
+) -> tuple[int, int, list[MeasureDiagnostic]]:
+    """Compare measures by position. Returns (perfect, compared, diagnostics)."""
+    n_compare = min(len(gt_measures), len(out_measures))
+    perfect = 0
+    diagnostics: list[MeasureDiagnostic] = []
+
+    for i in range(n_compare):
+        gt_m = gt_measures[i]
+        out_m = out_measures[i]
+
+        # Group notes by staff for this measure
+        gt_by_staff: dict[int, list[str]] = {}
+        out_by_staff: dict[int, list[str]] = {}
+
+        for n in gt_m.notes:
+            if n.is_grace:
+                continue
+            gt_by_staff.setdefault(n.staff, []).append(n.note_key())
+        for n in out_m.notes:
+            if n.is_grace:
+                continue
+            out_by_staff.setdefault(n.staff, []).append(n.note_key())
+
+        staves = sorted(set(gt_by_staff) | set(out_by_staff))
+        staff_errors: dict[int, list[str]] = {}
+        is_perfect = True
+
+        for staff in staves:
+            gt_keys = sorted(gt_by_staff.get(staff, []))
+            out_keys = sorted(out_by_staff.get(staff, []))
+            if gt_keys != out_keys:
+                is_perfect = False
+                # Summarize errors
+                matcher = SequenceMatcher(None, gt_keys, out_keys)
+                errs: list[str] = []
+                for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                    if tag == "equal":
+                        continue
+                    if tag == "delete":
+                        errs.extend(f"missing {gt_keys[k]}" for k in range(i1, i2))
+                    elif tag == "insert":
+                        errs.extend(f"extra {out_keys[k]}" for k in range(j1, j2))
+                    elif tag == "replace":
+                        for k in range(max(i2 - i1, j2 - j1)):
+                            g = gt_keys[i1 + k] if i1 + k < i2 else None
+                            o = out_keys[j1 + k] if j1 + k < j2 else None
+                            if g and o:
+                                errs.append(f"{g} -> {o}")
+                            elif g:
+                                errs.append(f"missing {g}")
+                            else:
+                                errs.append(f"extra {o}")
+                staff_errors[staff] = errs
+
+        if is_perfect:
+            perfect += 1
+
+        diagnostics.append(MeasureDiagnostic(
+            position_index=i,
+            gt_measure_num=gt_m.measure_num,
+            out_measure_num=out_m.measure_num,
+            is_perfect=is_perfect,
+            staff_errors=staff_errors,
+        ))
+
+    # Extra measures in either side
+    for i in range(n_compare, len(gt_measures)):
+        diagnostics.append(MeasureDiagnostic(
+            position_index=i,
+            gt_measure_num=gt_measures[i].measure_num,
+            out_measure_num=None,
+            is_perfect=False,
+            staff_errors={0: ["entire measure missing from output"]},
+        ))
+    for i in range(n_compare, len(out_measures)):
+        diagnostics.append(MeasureDiagnostic(
+            position_index=i,
+            gt_measure_num=None,
+            out_measure_num=out_measures[i].measure_num,
+            is_perfect=False,
+            staff_errors={0: ["extra measure in output"]},
+        ))
+
+    return perfect, len(diagnostics), diagnostics
+
+
+# ---------------------------------------------------------------------------
+# Duration check (from v1)
+# ---------------------------------------------------------------------------
+
+_TYPE_FRACTIONS: dict[str, float] = {
+    "maxima": 8.0, "long": 4.0, "breve": 2.0, "whole": 1.0,
+    "half": 0.5, "quarter": 0.25, "eighth": 0.125, "16th": 0.0625,
+    "32nd": 0.03125, "64th": 0.015625, "128th": 0.0078125,
+}
+
+
+def check_measure_durations(xml_path: str) -> dict[str, int]:
+    """Check output MusicXML for underfull/overfull measures vs time signature."""
+    try:
+        tree = ET.parse(xml_path)  # noqa: S314
+    except ET.ParseError:
+        return {"ok": 0, "underfull": 0, "overfull": 0}
+
+    root = tree.getroot()
+    ns = ""
+    if root.tag.startswith("{"):
+        ns = root.tag.split("}")[0] + "}"
+
+    result = {"ok": 0, "underfull": 0, "overfull": 0}
+
+    for part in root.iter(f"{ns}part"):
+        beats = 4
+        beat_type = 4
+        expected_duration = float(beats) / beat_type
+
+        for measure_elem in part.iter(f"{ns}measure"):
+            for attributes in measure_elem.iter(f"{ns}attributes"):
+                time_elem = attributes.find(f"{ns}time")
+                if time_elem is not None:
+                    b = time_elem.find(f"{ns}beats")
+                    bt = time_elem.find(f"{ns}beat-type")
+                    if b is not None and b.text and bt is not None and bt.text:
+                        try:
+                            beats = int(b.text)
+                            beat_type = int(bt.text)
+                            expected_duration = float(beats) / beat_type
+                        except ValueError:
+                            pass
+
+            total = 0.0
+            for note_elem in measure_elem.iter(f"{ns}note"):
+                if note_elem.find(f"{ns}grace") is not None:
+                    continue
+                if note_elem.find(f"{ns}chord") is not None:
+                    continue
+                type_elem = note_elem.find(f"{ns}type")
+                if type_elem is None or type_elem.text is None:
+                    continue
+                base = _TYPE_FRACTIONS.get(type_elem.text, 0.0)
+                dot_count = len(note_elem.findall(f"{ns}dot"))
+                dur = base
+                dot_val = base
+                for _ in range(dot_count):
+                    dot_val /= 2
+                    dur += dot_val
+                total += dur
+
+            if total == 0:
+                continue
+            tolerance = 0.01
+            if abs(total - expected_duration) < tolerance:
+                result["ok"] += 1
+            elif total < expected_duration - tolerance:
+                result["underfull"] += 1
+            else:
+                result["overfull"] += 1
+        break  # first part only
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Main entry points
+# ---------------------------------------------------------------------------
+
+def diagnose_to_result(
+    gt_parsed: ParsedXml,
+    out_parsed: ParsedXml,
+    out_xml_path: str | None = None,
+) -> DiagnosisResult:
+    """Run full diagnosis and return structured result."""
+    # 1. Flat note SER (headline)
+    note_ser, note_ser_by_staff, note_errors = _compare_flat_notes(
+        gt_parsed.notes, out_parsed.notes,
+    )
+
+    # 2. Structural metrics
+    key_acc = _compare_sequences(
+        "key_signatures",
+        [k.key() for k in gt_parsed.key_changes],
+        [k.key() for k in out_parsed.key_changes],
+    )
+    time_acc = _compare_sequences(
+        "time_signatures",
+        [t.key() for t in gt_parsed.time_changes],
+        [t.key() for t in out_parsed.time_changes],
+    )
+    clef_acc = _compare_sequences(
+        "clefs",
+        [c.key() for c in gt_parsed.clef_changes],
+        [c.key() for c in out_parsed.clef_changes],
+    )
+    tie_acc = _compare_ties(gt_parsed.notes, out_parsed.notes)
+    slur_acc = _compare_slurs(gt_parsed.notes, out_parsed.notes)
+    grace_acc = _compare_graces(gt_parsed.grace_notes, out_parsed.grace_notes)
+    artic_acc = _compare_articulations(gt_parsed.notes, out_parsed.notes)
+    repeat_acc = _compare_sequences(
+        "repeats",
+        [r.key() for r in gt_parsed.repeats],
+        [r.key() for r in out_parsed.repeats],
+    )
+
+    # 3. Measure diagnostics (positional)
+    perfect, compared, diagnostics = _compare_measures_positional(
+        gt_parsed.measures, out_parsed.measures,
+    )
+
+    # 4. Duration check
+    duration_check = {"ok": 0, "underfull": 0, "overfull": 0}
+    if out_xml_path:
+        duration_check = check_measure_durations(out_xml_path)
+
+    return DiagnosisResult(
+        note_ser=note_ser,
+        note_ser_by_staff=note_ser_by_staff,
+        note_errors=note_errors,
+        key_accuracy=key_acc,
+        time_accuracy=time_acc,
+        clef_accuracy=clef_acc,
+        tie_accuracy=tie_acc,
+        slur_accuracy=slur_acc,
+        grace_accuracy=grace_acc,
+        articulation_accuracy=artic_acc,
+        repeat_accuracy=repeat_acc,
+        measure_count_gt=len(gt_parsed.measures),
+        measure_count_out=len(out_parsed.measures),
+        perfect_measures=perfect,
+        total_measures_compared=compared,
+        measure_diagnostics=diagnostics,
+        duration_check=duration_check,
+    )
+
+
+def extract_and_diagnose(gt_path: str, out_path: str) -> DiagnosisResult:
+    """Convenience: extract + diagnose in one call."""
+    gt = extract_all(gt_path)
+    out = extract_all(out_path)
+    return diagnose_to_result(gt, out, out_xml_path=out_path)
+
+
+def diagnose(gt_path: str, out_path: str) -> None:
+    """Run full diagnostic and print human-readable output."""
+    result = extract_and_diagnose(gt_path, out_path)
+
+    print("=" * 60)
+    print("NOTE ACCURACY (flat sequence, per staff)")
+    print("=" * 60)
+    print(f"  Overall:  {result.note_ser.errors} errors / {result.note_ser.total} notes"
+          f"  = {result.note_ser.pct}% SER")
+    for staff, m in sorted(result.note_ser_by_staff.items()):
+        print(f"  Staff {staff}: {m.errors} errors / {m.total} notes = {m.pct}% SER")
+        for d in m.details[:10]:  # show first 10
+            print(f"    {d}")
+        if len(m.details) > 10:
+            print(f"    ... and {len(m.details) - 10} more")
+    print()
+
+    print("=" * 60)
+    print("STRUCTURAL ACCURACY")
+    print("=" * 60)
+    metrics = [
+        result.key_accuracy,
+        result.time_accuracy,
+        result.clef_accuracy,
+        result.tie_accuracy,
+        result.slur_accuracy,
+        result.grace_accuracy,
+        result.articulation_accuracy,
+        result.repeat_accuracy,
+    ]
+    for m in metrics:
+        status = "PERFECT" if m.errors == 0 and m.total > 0 else (
+            "N/A" if m.total == 0 else f"{m.errors} errors"
+        )
+        print(f"  {m.name:<20} {m.errors:>3} / {m.total:>3}  {status}")
+        for d in m.details[:5]:
+            print(f"    {d}")
+    print()
+
+    print("=" * 60)
+    print("MEASURE DIAGNOSTICS (positional)")
+    print("=" * 60)
+    print(f"  GT measures:     {result.measure_count_gt}")
+    print(f"  Output measures: {result.measure_count_out}")
+    print(f"  Perfect:         {result.perfect_measures} / {result.total_measures_compared}")
+    if result.total_measures_compared > 0:
+        pct = round(100 * result.perfect_measures / result.total_measures_compared)
+        print(f"                   ({pct}%)")
+
+    # Show imperfect measures
+    imperfect = [d for d in result.measure_diagnostics if not d.is_perfect]
+    if imperfect:
+        print(f"\n  Imperfect measures ({len(imperfect)}):")
+        for d in imperfect[:20]:
+            gt_label = f"GT M{d.gt_measure_num}" if d.gt_measure_num is not None else "GT ---"
+            out_label = f"Out M{d.out_measure_num}" if d.out_measure_num is not None else "Out ---"
+            print(f"    [{d.position_index}] {gt_label} vs {out_label}")
+            for staff, errs in sorted(d.staff_errors.items()):
+                for e in errs[:5]:
+                    print(f"      staff {staff}: {e}")
+        if len(imperfect) > 20:
+            print(f"    ... and {len(imperfect) - 20} more")
+    print()
+
+    # Duration check
+    dc = result.duration_check
+    if any(dc.values()):
+        print("=" * 60)
+        print("DURATION CHECK")
+        print("=" * 60)
+        print(f"  OK: {dc['ok']}, Underfull: {dc['underfull']}, Overfull: {dc['overfull']}")
+        print()
+
+
+def main() -> None:
+    if len(sys.argv) < 3:
+        print("Usage: python diagnose_musicxml_v2.py <ground_truth.xml> <output.musicxml>")
+        sys.exit(1)
+
+    gt_path = sys.argv[1]
+    out_path = sys.argv[2]
+    diagnose(gt_path, out_path)
+
+
+if __name__ == "__main__":
+    main()

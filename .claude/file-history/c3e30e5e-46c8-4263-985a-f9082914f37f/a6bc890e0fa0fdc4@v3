@@ -1,0 +1,8 @@
+builds/
+runs/
+spot/
+logs/
+.venv/
+__pycache__/
+*.npy
+*.png

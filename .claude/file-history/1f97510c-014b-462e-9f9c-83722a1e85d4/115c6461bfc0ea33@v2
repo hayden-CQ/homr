@@ -1,0 +1,13 @@
+---
+name: Bass geometric pitch correction disabled
+description: correct_pitches() skips all bass tokens via position filter — proposed fix in research Cycle 1
+type: project
+---
+
+Geometric pitch correction in `geometric_pitch_correction.py:174` filters `sym.position != "lower"`, skipping all bass notes. When processing bass staves (voice 1), the function collects phantom treble tokens ("upper") and matches them against bass geometric noteheads — effectively a no-op.
+
+**Why:** The original filter assumed geometric noteheads only exist for the current physical staff (true), but applied the wrong position filter for bass staves. Bass staff crops have real bass notes at position="lower" and phantom treble at position="upper".
+
+**How to apply:** Fix by making position filter context-aware: when initial_clef is a bass clef (F3/F4/F5), correct "lower" tokens. When treble (G1/G2), correct "upper" (current behavior). Estimated 500-900 error reduction across 68 grand-staff pieces. Proposed in research Cycle 1 Claude Turn 1.
+
+**Key data:** 41% of errors are on bass. 12 pieces have bass SER >10 points worse than treble. Pitch-related errors (step+octave+far_pitch) = 4,371 total.

@@ -1,0 +1,4 @@
+# Memory Index
+
+- [project_eval_infrastructure.md](project_eval_infrastructure.md) — Historical eval data stored outside repo to survive git operations
+- [feedback_step_by_step.md](feedback_step_by_step.md) — User prefers incremental collaboration over scripted automation

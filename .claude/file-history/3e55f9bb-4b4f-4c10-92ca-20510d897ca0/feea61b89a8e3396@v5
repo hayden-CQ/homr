@@ -1,0 +1,602 @@
+#!/usr/bin/env python3
+"""
+Standalone evaluation runner: run homr from any checkout against the external corpus.
+
+This script lives OUTSIDE the homr repo so it survives git checkout/clean operations.
+It calls `poetry run homr` from a specified repo directory.
+
+Data layout (relative to this script's parent directory):
+  sources/piece-001.xml          — ground truth
+  corpus/piece-001/page-01.png   — rendered page images
+  runs/<effort>/<hash>_avg<ser>/ — full run results
+  spot/<piece>/<effort>/...      — spot check results
+  manifest.json                  — piece metadata
+
+Usage:
+    python scripts/run_evaluation.py --homr-dir /path/to/homr
+    python scripts/run_evaluation.py --homr-dir /path/to/homr --piece piece-011
+    python scripts/run_evaluation.py --homr-dir /path/to/homr --piece piece-011 --debug
+    TAG=my-experiment python scripts/run_evaluation.py --homr-dir /path/to/homr
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DATA_DIR = SCRIPT_DIR.parent
+
+sys.path.insert(0, str(SCRIPT_DIR))
+from diagnose_musicxml import (
+    DiagnosisResult,
+    MeasureNotes,
+    check_measure_durations,
+    diagnose_to_result,
+    extract_measures,
+)
+
+ALL_CATEGORIES = [
+    "missing", "extra", "octave", "accidental", "enharmonic",
+    "step", "rhythm", "rest_note_swap", "cross_staff", "far_pitch",
+]
+
+
+def load_manifest() -> dict:
+    manifest_path = DATA_DIR / "manifest.json"
+    if not manifest_path.exists():
+        print(f"ERROR: {manifest_path} not found", file=sys.stderr)
+        sys.exit(1)
+    with open(manifest_path) as f:
+        return json.load(f)
+
+
+def _get_git_info(homr_dir: Path) -> tuple[str, str]:
+    """Return (short_commit_hash, branch_name) from the homr checkout."""
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short=7", "HEAD"],
+            cwd=str(homr_dir),
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except Exception:
+        commit = "unknown"
+    try:
+        branch = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(homr_dir),
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except Exception:
+        branch = "unknown"
+    return commit, branch
+
+
+def _get_effort_name(branch: str) -> str:
+    """Derive effort name from git branch, or TAG env var."""
+    tag = os.environ.get("TAG", "").strip()
+    if tag:
+        return tag
+
+    if branch in ("unknown", "HEAD"):
+        return "unknown"
+
+    for prefix in ("feature/", "experiment/", "hotfix/", "fix/", "bugfix/"):
+        if branch.startswith(prefix):
+            branch = branch[len(prefix):]
+            break
+
+    return branch.replace("/", "-")
+
+
+def _find_page_images(piece_id: str) -> list[Path]:
+    """Find page images for a piece in corpus/."""
+    piece_dir = DATA_DIR / "corpus" / piece_id
+    if not piece_dir.is_dir():
+        return []
+    page_pattern = re.compile(r"^page-\d+\.png$")
+    return sorted(p for p in piece_dir.iterdir() if page_pattern.match(p.name))
+
+
+def _run_homr_on_page(
+    homr_dir: Path, image_path: Path, debug: bool = False, gpu: str = "no"
+) -> Path | None:
+    """Run homr on a single page image. Returns output .musicxml path or None."""
+    expected_output = image_path.with_suffix(".musicxml")
+    cmd = ["poetry", "run", "homr", "--gpu", gpu, "--cache"]
+    if debug:
+        cmd.append("--debug")
+    cmd.append(str(image_path))
+
+    # Pass through diagnostic env vars and log stderr when diagnosing
+    env = None
+    diagnose = os.environ.get("HOMR_DIAGNOSE_STAFFS")
+    if diagnose:
+        env = {**os.environ, "HOMR_DIAGNOSE_STAFFS": diagnose}
+
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(homr_dir),
+            check=True,
+            capture_output=True,
+            timeout=300,
+            env=env,
+        )
+        if diagnose and result.stderr:
+            stderr_text = result.stderr.decode(errors="replace")
+            log_dir = DATA_DIR / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir / f"diag_{image_path.stem}.log"
+            with open(log_file, "w") as f:
+                f.write(stderr_text)
+            print(f"    diag log: {log_file}", file=sys.stderr)
+    except subprocess.CalledProcessError as e:
+        stderr_text = (e.stderr or b"").decode(errors="replace").strip()
+        tail = "\n".join(stderr_text.splitlines()[-3:]) if stderr_text else "(no output)"
+        print(f"    FAILED: {image_path.name}:\n      {tail}", file=sys.stderr)
+        return None
+    except subprocess.TimeoutExpired:
+        print(f"    FAILED: {image_path.name}: timed out after 300s", file=sys.stderr)
+        return None
+
+    if expected_output.exists():
+        return expected_output
+    return None
+
+
+def _capture_debug_images(piece_id: str, page_name: str, dest_dir: Path) -> None:
+    """Copy debug images from corpus/ into the run directory."""
+    source_debug = DATA_DIR / "corpus" / piece_id / "debug"
+    if not source_debug.is_dir():
+        return
+
+    page_prefix = page_name + "_"
+    debug_files = [f for f in source_debug.iterdir() if f.name.startswith(page_prefix)]
+    if not debug_files:
+        return
+
+    dest_debug = dest_dir / "debug"
+    dest_debug.mkdir(parents=True, exist_ok=True)
+    for f in debug_files:
+        shutil.copy2(f, dest_debug / f.name)
+
+
+def _merge_output_measures(
+    output_xmls: list[Path],
+) -> tuple[list[MeasureNotes], dict[int, str]]:
+    """Merge measures from multiple output pages, renumbering sequentially."""
+    all_measures: list[MeasureNotes] = []
+    measure_to_page: dict[int, str] = {}
+    offset = 0
+
+    for f in output_xmls:
+        page_measures = extract_measures(str(f))
+        if not page_measures:
+            continue
+        for m in page_measures:
+            renumbered_num = m.measure_num + offset
+            renumbered = MeasureNotes(
+                measure_num=renumbered_num,
+                notes_by_staff=m.notes_by_staff,
+            )
+            all_measures.append(renumbered)
+            measure_to_page[renumbered_num] = f.name
+        max_num = max(m.measure_num for m in page_measures)
+        offset += max_num
+
+    return all_measures, measure_to_page
+
+
+def diagnose_piece(
+    gt_xml: Path,
+    output_xmls: list[Path],
+) -> tuple[DiagnosisResult, dict[str, dict]] | None:
+    """Run diagnosis for one piece against its ground truth."""
+    gt_measures = extract_measures(str(gt_xml))
+    out_measures, measure_to_page = _merge_output_measures(output_xmls)
+
+    if not gt_measures or not out_measures:
+        return None
+
+    out_xml_path = str(output_xmls[0]) if output_xmls else None
+    duration_totals = {"ok": 0, "underfull": 0, "overfull": 0}
+    for oxml in output_xmls:
+        page_dur = check_measure_durations(str(oxml))
+        for k in duration_totals:
+            duration_totals[k] += page_dur[k]
+
+    result = diagnose_to_result(gt_measures, out_measures, out_xml_path)
+    result.duration_check = duration_totals
+
+    # Build per-page error summary
+    page_measure_errors: dict[str, dict[int, list[str]]] = defaultdict(lambda: defaultdict(list))
+    page_all_measures: dict[str, set[int]] = defaultdict(set)
+    for e in result.errors:
+        page = measure_to_page.get(e.measure)
+        if page:
+            page_measure_errors[page][e.measure].append(e.category)
+    for mnum, page in measure_to_page.items():
+        page_all_measures[page].add(mnum)
+
+    per_page: dict[str, dict] = {}
+    for page in sorted(set(measure_to_page.values())):
+        measures_on_page = sorted(page_all_measures.get(page, set()))
+        error_measures = page_measure_errors.get(page, {})
+        total_errors = sum(len(cats) for cats in error_measures.values())
+        measure_detail: dict[str, dict[str, int]] = {}
+        for mnum in sorted(error_measures):
+            cats: dict[str, int] = defaultdict(int)
+            for cat in error_measures[mnum]:
+                cats[cat] += 1
+            measure_detail[str(mnum)] = dict(cats)
+        per_page[page] = {
+            "errors": total_errors,
+            "measures": len(measures_on_page),
+            "measure_errors": measure_detail,
+        }
+
+    return result, per_page
+
+
+def _count_output_notes(output_xmls: list[Path]) -> int:
+    """Count total notes in output XMLs."""
+    total = 0
+    for oxml in output_xmls:
+        measures = extract_measures(str(oxml))
+        for m in measures:
+            for staff_notes in m.notes_by_staff.values():
+                total += sum(1 for n in staff_notes if n.pitch != "rest")
+    return total
+
+
+def _create_run_dir(
+    effort: str, commit: str, is_spot: bool, piece_id: str | None = None,
+) -> Path:
+    """Create a run directory with a pending name."""
+    if is_spot and piece_id:
+        base = DATA_DIR / "spot" / piece_id / effort
+    else:
+        base = DATA_DIR / "runs" / effort
+    base.mkdir(parents=True, exist_ok=True)
+    pending_name = f"{commit}_pending"
+    run_dir = base / pending_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def _finalize_run_dir(run_dir: Path, ser: int, is_spot: bool) -> Path:
+    """Rename run directory from pending to final name with SER."""
+    ser_label = f"ser{ser}" if is_spot else f"avg{ser}"
+    commit = run_dir.name.replace("_pending", "")
+    new_name = f"{commit}_{ser_label}"
+    new_path = run_dir.parent / new_name
+
+    if new_path.exists():
+        shutil.rmtree(new_path)
+
+    run_dir.rename(new_path)
+
+    # Update latest symlink
+    latest = run_dir.parent / "latest"
+    if latest.is_symlink():
+        latest.unlink()
+    latest.symlink_to(new_name)
+
+    return new_path
+
+
+def _process_piece(
+    piece_id: str,
+    info: dict,
+    piece_run_dir: Path,
+    homr_dir: Path,
+    debug: bool,
+    gpu: str = "no",
+) -> tuple[dict, int] | None:
+    """Process a single piece: run homr, diagnose, capture debug images."""
+    gt_xml = DATA_DIR / "sources" / f"{piece_id}.xml"
+    if not gt_xml.exists():
+        print(f"  SKIP {piece_id} ({info['name']}): no ground truth", file=sys.stderr)
+        return None
+
+    piece_run_dir.mkdir(parents=True, exist_ok=True)
+
+    page_images = _find_page_images(piece_id)
+    if not page_images:
+        print(f"  SKIP {piece_id} ({info['name']}): no page images", file=sys.stderr)
+        return None
+
+    print(f"  {piece_id}: processing {len(page_images)} pages ({info['name']})...")
+    output_xmls = []
+    for img in page_images:
+        result = _run_homr_on_page(homr_dir, img, debug=debug, gpu=gpu)
+        if result:
+            dest = piece_run_dir / result.name
+            shutil.copy2(result, dest)
+            output_xmls.append(result)
+
+            if debug:
+                page_stem = img.stem
+                page_subdir = piece_run_dir / page_stem
+                _capture_debug_images(piece_id, page_stem, page_subdir)
+
+    if not output_xmls:
+        print(f"  SKIP {piece_id}: no output", file=sys.stderr)
+        return None
+
+    diag_result = diagnose_piece(gt_xml, output_xmls)
+    if diag_result is None:
+        print(f"  SKIP {piece_id}: diagnosis failed", file=sys.stderr)
+        return None
+    diag, per_page = diag_result
+
+    output_notes = _count_output_notes(output_xmls)
+
+    edit_dist = len(diag.errors)
+    orig_notes = info.get("ground_truth_notes", 0)
+    ser = round(100 * edit_dist / max(orig_notes, 1))
+
+    piece_data = {
+        "name": info["name"],
+        "ser": ser,
+        "edit_distance": edit_dist,
+        "original_notes": orig_notes,
+        "output_notes": output_notes,
+        "perfect_measures": diag.perfect_measures,
+        "total_measures": diag.total_measures,
+        "duration_check": diag.duration_check,
+        "errors": {k: v for k, v in diag.error_counts.items() if v > 0},
+        "per_staff_errors": {str(k): v for k, v in diag.per_staff_errors.items()},
+        "per_page": per_page,
+    }
+
+    diag_path = piece_run_dir / "diagnosis.json"
+    with open(diag_path, "w") as f:
+        json.dump(piece_data, f, indent=2)
+
+    return piece_data, ser
+
+
+def run_evaluation(
+    pieces: list[str],
+    manifest: dict,
+    homr_dir: Path,
+    debug: bool = False,
+    gpu: str = "no",
+    is_spot: bool = False,
+) -> dict:
+    """Run evaluation on specified pieces. Returns results dict."""
+    commit, branch = _get_git_info(homr_dir)
+    effort = _get_effort_name(branch)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+
+    spot_piece = pieces[0] if is_spot and len(pieces) == 1 else None
+
+    run_dir = _create_run_dir(effort, commit, is_spot=is_spot, piece_id=spot_piece)
+    print(f"Effort: {effort} | Commit: {commit} | Branch: {branch}")
+    print(f"Homr dir: {homr_dir}")
+
+    piece_results: dict[str, dict] = {}
+    overall_errors: dict[str, int] = defaultdict(int)
+    overall_perfect = 0
+    overall_measures = 0
+    total_error_count = 0
+
+    for piece_id in pieces:
+        info = manifest.get(piece_id)
+        if not info:
+            print(f"  SKIP {piece_id}: not in manifest", file=sys.stderr)
+            continue
+
+        piece_run_dir = run_dir / piece_id if not is_spot else run_dir
+        result = _process_piece(piece_id, info, piece_run_dir, homr_dir, debug, gpu=gpu)
+        if result is None:
+            continue
+        piece_data, ser = result
+
+        piece_results[piece_id] = piece_data
+        overall_perfect += piece_data["perfect_measures"]
+        overall_measures += piece_data["total_measures"]
+        total_error_count += piece_data["edit_distance"]
+        for cat, cnt in piece_data.get("errors", {}).items():
+            overall_errors[cat] += cnt
+
+    if not piece_results:
+        print("No pieces processed.", file=sys.stderr)
+        if run_dir.exists():
+            shutil.rmtree(run_dir)
+        return {}
+
+    avg_ser = round(sum(p["ser"] for p in piece_results.values()) / len(piece_results))
+
+    if is_spot and spot_piece:
+        final_ser = piece_results[spot_piece]["ser"]
+        run_dir = _finalize_run_dir(run_dir, final_ser, is_spot=True)
+    else:
+        run_dir = _finalize_run_dir(run_dir, avg_ser, is_spot=False)
+
+    results = {
+        "timestamp": timestamp,
+        "effort": effort,
+        "git_commit": commit,
+        "git_branch": branch,
+        "homr_dir": str(homr_dir),
+        "overall": {
+            "pieces": len(piece_results),
+            "avg_ser": avg_ser,
+            "perfect_measures_pct": (
+                round(100 * overall_perfect / overall_measures)
+                if overall_measures > 0 else 0
+            ),
+            "perfect_measures": overall_perfect,
+            "total_measures": overall_measures,
+            "total_errors": total_error_count,
+            "by_category": {k: v for k, v in overall_errors.items() if v > 0},
+        },
+        "pieces": piece_results,
+    }
+
+    results_path = run_dir / "results.json"
+    with open(results_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    _write_summary(run_dir, results)
+
+    if not is_spot:
+        _update_progress(results)
+
+    # Generate HTML
+    from generate_html import generate_all_html, generate_run_html
+
+    generate_run_html(run_dir, is_spot=is_spot)
+    generate_all_html()
+
+    print(f"\nRun complete: {run_dir}")
+    print(f"  {len(piece_results)} pieces, avg SER {avg_ser}%")
+    print(f"  {overall_perfect}/{overall_measures} perfect measures")
+    return results
+
+
+def _write_summary(run_dir: Path, results: dict) -> None:
+    """Generate human-readable summary.md."""
+    o = results["overall"]
+    lines = [
+        f"# Evaluation Run: {results['effort']} / {results['git_commit']}",
+        f"Branch: {results['git_branch']}",
+        f"Date: {results['timestamp']}",
+        "",
+        "## Overall",
+        f"- **{o['pieces']} pieces**, average SER **{o['avg_ser']}%**",
+        f"- **{o['perfect_measures_pct']}% perfect measures**"
+        f" ({o['perfect_measures']}/{o['total_measures']})",
+        f"- Total errors: {o['total_errors']:,}",
+        "",
+        "## Error Breakdown",
+        "| Category | Count | % |",
+        "|----------|------:|--:|",
+    ]
+
+    by_cat = o.get("by_category", {})
+    total_err = o["total_errors"] or 1
+    for cat in ALL_CATEGORIES:
+        cnt = by_cat.get(cat, 0)
+        if cnt > 0:
+            pct = 100 * cnt / total_err
+            lines.append(f"| {cat} | {cnt:,} | {pct:.1f} |")
+
+    pieces = results.get("pieces", {})
+    if pieces:
+        sorted_by_ser = sorted(pieces.items(), key=lambda x: x[1]["ser"])
+
+        lines.extend([
+            "",
+            "## Best Pieces (lowest SER)",
+            "| ID | Name | SER | Perfect/Total |",
+            "|----|------|----:|:--------------|",
+        ])
+        for pid, data in sorted_by_ser[:10]:
+            pm = data["perfect_measures"]
+            tm = data["total_measures"]
+            lines.append(f"| {pid} | {data['name']} | {data['ser']}% | {pm}/{tm} |")
+
+        lines.extend([
+            "",
+            "## Worst Pieces (highest SER)",
+            "| ID | Name | SER | Perfect/Total |",
+            "|----|------|----:|:--------------|",
+        ])
+        for pid, data in sorted_by_ser[-10:]:
+            pm = data["perfect_measures"]
+            tm = data["total_measures"]
+            lines.append(f"| {pid} | {data['name']} | {data['ser']}% | {pm}/{tm} |")
+
+    summary_path = run_dir / "summary.md"
+    with open(summary_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _update_progress(results: dict) -> None:
+    """Append a row to PROGRESS.md."""
+    progress_path = DATA_DIR / "PROGRESS.md"
+    o = results["overall"]
+
+    header = (
+        "# Evaluation Progress\n\n"
+        "| Date | Effort | Commit | Pieces | Avg SER | Perfect% "
+        "| Missing | Extra | Notes |\n"
+        "|------|--------|--------|-------:|--------:|---------:"
+        "|--------:|------:|-------|\n"
+    )
+
+    row = (
+        f"| {results['timestamp'][:10]} "
+        f"| {results['effort']} "
+        f"| {results['git_commit']} "
+        f"| {o['pieces']} "
+        f"| {o['avg_ser']}% "
+        f"| {o['perfect_measures_pct']}% "
+        f"| {o.get('by_category', {}).get('missing', 0):,} "
+        f"| {o.get('by_category', {}).get('extra', 0):,} "
+        f"| |\n"
+    )
+
+    if not progress_path.exists():
+        with open(progress_path, "w") as f:
+            f.write(header + row)
+    else:
+        with open(progress_path, "a") as f:
+            f.write(row)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run homr evaluation")
+    parser.add_argument(
+        "--homr-dir", type=str, required=True,
+        help="Path to homr repo checkout (or worktree)",
+    )
+    parser.add_argument("--piece", type=str, help="Evaluate a single piece (e.g. piece-011)")
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Run homr with --debug flag (writes intermediate images)",
+    )
+    parser.add_argument(
+        "--gpu", type=str, default="no",
+        help="Pass --gpu to homr (no/yes/auto/force, default: no)",
+    )
+    args = parser.parse_args()
+
+    homr_dir = Path(args.homr_dir).resolve()
+    if not (homr_dir / "pyproject.toml").exists():
+        print(f"ERROR: {homr_dir} doesn't look like a homr checkout", file=sys.stderr)
+        sys.exit(1)
+
+    manifest = load_manifest()
+
+    if args.piece:
+        if args.piece not in manifest:
+            print(f"ERROR: '{args.piece}' not in manifest", file=sys.stderr)
+            sys.exit(1)
+        pieces = [args.piece]
+        is_spot = True
+    else:
+        pieces = sorted(manifest.keys())
+        is_spot = False
+
+    run_evaluation(
+        pieces, manifest,
+        homr_dir=homr_dir,
+        debug=args.debug,
+        gpu=args.gpu,
+        is_spot=is_spot,
+    )
+
+
+if __name__ == "__main__":
+    main()

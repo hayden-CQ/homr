@@ -1,0 +1,54 @@
+# Session State
+
+## Current Task
+Pickup (anacrusis) detection improvement and false positive analysis on branch `feature/bass-clef-extrapolation-20260317`.
+
+## Progress
+- **Pickup detection implemented** in `music_xml_generator.py:_first_measure_is_pickup()` — compares first measure duration to median measure duration
+- **Threshold tuned**: `first_dur <= nominator/2` reduces false positives vs original `first_dur < nominator`
+- **Eval results** (commit 53f1f40): avg SER 48% → ~35%, 40 pieces improved, 21 regressed
+- **Dewarping fill_color fix** in `staff_dewarping.py` — default changed from 1 (near-black) to 255 (white)
+- **Trace logging crash fixes** in `main.py` — `grid[0].y` list access, missing `notes` attribute guard
+- **4 false positive pickups identified** (pieces 067, 047, 031, 015):
+  - All have `first_dur = 1/3 of nominator` with `last_dur=0`
+  - TrOmr misplaces first barline in 3/4 time (generates barline after 1 beat instead of 3)
+  - Confirmed via debug images: all notes visible in crop, model-level bias
+  - **Cannot fix without retraining TrOmr**
+- **Multi-voice consensus attempted and abandoned**: SymbolChord mixes upper/lower positions in same chord, making per-staff analysis impossible
+- **Reverted to simple approach** at commit `53f1f40`
+
+## What Was Tried
+
+| Approach | Result | Notes |
+|----------|--------|-------|
+| `first_dur < nominator` threshold | Too many false positives | 48%→39%, 34 improved, 28 regressed |
+| `first_dur <= nominator/2` threshold | Better balance | 48%→~35%, 40 improved, 21 regressed |
+| Last-measure confirmation (`last_dur > 0 && last_dur < nominator`) | Helps true pickups, no effect on FPs | Most pieces have last_dur=0 |
+| Sub-voice splitting (upper/lower) | Fundamentally broken | SymbolChord mixes positions in same chord |
+| Multi-voice consensus | Abandoned | Same SymbolChord mixing problem |
+| Debug image analysis for FP pieces | Confirmed TrOmr model bias | Notes visible, barline misplaced |
+| HOMR_PICKUP_DEBUG file-based logging | Works | Eval captures stderr, must use file path |
+
+## Key Commits
+- `728de4b` — bass clef extrapolation fix (staff_detection.py)
+- `27c0c77` — pickup detection + fill_color fix + trace logging fix
+- `53f1f40` — reverted to simple pickup detection (current HEAD)
+
+## Files Changed from Main
+1. `homr/music_xml_generator.py` — pickup detection (`_first_measure_is_pickup()`)
+2. `homr/staff_dewarping.py` — fill_color default 1→255
+3. `homr/main.py` — trace logging crash fixes
+
+## GT Pickup Pieces (14 of 69)
+piece-008, 016, 024, 025, 027, 030, 034, 040, 041, 051, 054, 055, 065, 066
+
+## Next Steps
+1. Run full 69-piece eval with current code (53f1f40) to get clean baseline numbers
+2. Tackle bucket 2: ~17 small regressions (1-28 points) from other branch changes
+3. Bass template issue is separate/pre-existing (saved in memory)
+
+## Branches
+- `feature/bass-clef-extrapolation-20260317` — current, at commit `53f1f40`
+
+---
+*Saved: 2026-03-18*

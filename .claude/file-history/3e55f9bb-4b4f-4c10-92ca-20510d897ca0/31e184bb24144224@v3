@@ -1,0 +1,310 @@
+"""
+One-time corpus setup: copy ground truth and page images into evaluation/ structure.
+
+Copies (not moves) from roundtrip_results/ into:
+  evaluation/sources/piece-001.xml              — ground truth
+  evaluation/pages/piece-001/page-01.png        — rendered page images
+  evaluation/manifest.json                      — maps piece IDs to original names
+
+Usage:
+    python -m evaluation.setup_corpus [roundtrip_results/]
+    python -m evaluation.setup_corpus --render       # render missing page images
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).parent
+DEFAULT_ROUNDTRIP = SCRIPT_DIR.parent / "roundtrip_results"
+
+
+def _find_ground_truth_xml(piece_dir: Path) -> Path | None:
+    """Find the XML inside an extracted MXL directory (skip META-INF)."""
+    for root, _dirs, files in os.walk(piece_dir):
+        if "META-INF" in root:
+            continue
+        for f in files:
+            if f.endswith(".xml"):
+                return Path(root) / f
+    return None
+
+
+def _count_notes_in_xml(xml_path: Path) -> int:
+    """Count non-grace, non-rest notes in a MusicXML file."""
+    try:
+        tree = ET.parse(str(xml_path))  # noqa: S314
+    except ET.ParseError:
+        return 0
+    root = tree.getroot()
+    ns = ""
+    if root.tag.startswith("{"):
+        ns = root.tag.split("}")[0] + "}"
+
+    count = 0
+    for note in root.iter(f"{ns}note"):
+        if note.find(f"{ns}grace") is not None:
+            continue
+        if note.find(f"{ns}rest") is not None:
+            continue
+        count += 1
+    return count
+
+
+def _count_measures_in_xml(xml_path: Path) -> int:
+    """Count measures in a MusicXML file (from first part only)."""
+    try:
+        tree = ET.parse(str(xml_path))  # noqa: S314
+    except ET.ParseError:
+        return 0
+    root = tree.getroot()
+    ns = ""
+    if root.tag.startswith("{"):
+        ns = root.tag.split("}")[0] + "}"
+
+    for part in root.iter(f"{ns}part"):
+        return len(list(part.iter(f"{ns}measure")))
+    return 0
+
+
+def _find_page_images(piece_name: str, images_dir: Path) -> list[Path]:
+    """Find all page PNGs for a piece in the images directory."""
+    pages = sorted(
+        p
+        for p in images_dir.glob(f"{piece_name}-*.png")
+        if "_teaser" not in p.name
+        and "_debug" not in p.name
+        and "_staff" not in p.name
+        and "_tesseract" not in p.name
+    )
+    return pages
+
+
+def _render_xml_to_pages(xml_path: Path, output_dir: Path, dpi: int = 300) -> list[Path]:
+    """Render a MusicXML file to per-page PNGs via MuseScore + PyMuPDF.
+
+    Returns list of output PNG paths.
+    """
+    try:
+        import fitz  # noqa: F401, PLC0415
+    except ImportError:
+        print("ERROR: PyMuPDF not installed. Run: poetry add --group dev pymupdf", file=sys.stderr)
+        sys.exit(1)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pdf_path = os.path.join(tmp, "score.pdf")
+
+        # Render XML → PDF via MuseScore
+        try:
+            result = subprocess.run(  # noqa: S603
+                ["musescore", "-o", pdf_path, str(xml_path)],  # noqa: S607
+                capture_output=True,
+                timeout=120,
+                check=False,
+            )
+            if result.returncode != 0 or not os.path.exists(pdf_path):
+                stderr_msg = result.stderr.decode(errors="replace")[:200]
+                print(
+                    f"    MuseScore failed (rc={result.returncode}): {stderr_msg}", file=sys.stderr
+                )
+                return []
+        except FileNotFoundError:
+            print("ERROR: musescore not found in PATH. Install MuseScore.", file=sys.stderr)
+            sys.exit(1)
+        except subprocess.TimeoutExpired:
+            print(f"    MuseScore timed out on {xml_path.name}", file=sys.stderr)
+            return []
+
+        # Convert PDF → per-page PNGs via PyMuPDF
+        import fitz  # noqa: PLC0415
+
+        doc = fitz.open(pdf_path)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        pages: list[Path] = []
+
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            zoom = dpi / 72.0
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat)
+
+            dest = output_dir / f"page-{page_num + 1:02d}.png"
+            pix.save(str(dest))
+            pages.append(dest)
+
+        doc.close()
+        return pages
+
+
+def setup_corpus(roundtrip_dir: Path) -> None:
+    xml_dir = roundtrip_dir / "xml_extracted"
+    images_dir = roundtrip_dir / "images"
+
+    if not xml_dir.is_dir():
+        print(f"ERROR: {xml_dir} not found", file=sys.stderr)
+        sys.exit(1)
+
+    sources_dir = SCRIPT_DIR / "sources"
+    pages_dir = SCRIPT_DIR / "pages"
+    sources_dir.mkdir(exist_ok=True)
+    pages_dir.mkdir(exist_ok=True)
+
+    manifest: dict[str, dict] = {}
+    pieces = sorted(d.name for d in xml_dir.iterdir() if d.is_dir())
+
+    for i, piece_name in enumerate(pieces, start=1):
+        piece_id = f"piece-{i:03d}"
+
+        gt_xml = _find_ground_truth_xml(xml_dir / piece_name)
+        if gt_xml is None:
+            print(f"  SKIP {piece_name}: no XML found", file=sys.stderr)
+            continue
+
+        # Copy ground truth as piece-NNN.xml
+        dest_xml = sources_dir / f"{piece_id}.xml"
+        if not dest_xml.exists():
+            shutil.copy2(gt_xml, dest_xml)
+        print(f"  {piece_id}: {piece_name}")
+
+        # Copy page images as piece-NNN/page-NN.png
+        page_images = _find_page_images(piece_name, images_dir)
+        piece_pages_dir = pages_dir / piece_id
+        piece_pages_dir.mkdir(exist_ok=True)
+
+        for j, page_img in enumerate(page_images, start=1):
+            dest_img = piece_pages_dir / f"page-{j:02d}.png"
+            if not dest_img.exists():
+                shutil.copy2(page_img, dest_img)
+
+        # Also check output_full for page count (pages may not all have images yet)
+        output_full_dir = roundtrip_dir / "output_full" / piece_name
+        output_page_count = 0
+        if output_full_dir.is_dir():
+            output_page_count = len(list(output_full_dir.glob("*.musicxml")))
+
+        total_pages = max(len(page_images), output_page_count)
+
+        # Build manifest entry
+        note_count = _count_notes_in_xml(dest_xml)
+        measure_count = _count_measures_in_xml(dest_xml)
+        manifest[piece_id] = {
+            "name": piece_name.replace("_", " "),
+            "original_dir": piece_name,
+            "pages": total_pages,
+            "page_images_available": len(page_images),
+            "ground_truth_notes": note_count,
+            "ground_truth_measures": measure_count,
+        }
+
+    # Write manifest
+    manifest_path = SCRIPT_DIR / "manifest.json"
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=False)
+
+    print(f"\nManifest written: {manifest_path}")
+    print(f"  {len(manifest)} pieces")
+    total_notes = sum(p["ground_truth_notes"] for p in manifest.values())
+    total_pages_sum = sum(p["pages"] for p in manifest.values())
+    total_images = sum(p["page_images_available"] for p in manifest.values())
+    print(f"  {total_notes} total ground truth notes")
+    print(f"  {total_pages_sum} total pages ({total_images} with images)")
+
+
+def render_missing_pages() -> None:
+    """Render missing page images for all pieces in the manifest."""
+    manifest_path = SCRIPT_DIR / "manifest.json"
+    if not manifest_path.exists():
+        print(
+            "ERROR: manifest.json not found. Run: python -m evaluation.setup_corpus first",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Check dependencies early
+    if not shutil.which("musescore"):
+        print("ERROR: musescore not found in PATH. Install MuseScore.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        import fitz  # noqa: F401, PLC0415
+    except ImportError:
+        print("ERROR: PyMuPDF not installed. Run: poetry add --group dev pymupdf", file=sys.stderr)
+        sys.exit(1)
+
+    with open(manifest_path) as f:
+        manifest: dict[str, dict] = json.load(f)
+
+    sources_dir = SCRIPT_DIR / "sources"
+    pages_dir = SCRIPT_DIR / "pages"
+
+    rendered = 0
+    skipped = 0
+    failed = 0
+
+    for piece_id, info in sorted(manifest.items()):
+        piece_pages_dir = pages_dir / piece_id
+        existing = sorted(piece_pages_dir.glob("page-*.png")) if piece_pages_dir.is_dir() else []
+        expected = info.get("pages", 0)
+
+        if 0 < expected <= len(existing):
+            skipped += 1
+            continue
+
+        gt_xml = sources_dir / f"{piece_id}.xml"
+        if not gt_xml.exists():
+            print(f"  SKIP {piece_id} ({info['name']}): no ground truth XML", file=sys.stderr)
+            failed += 1
+            continue
+
+        print(f"  {piece_id}: rendering {info['name']}...")
+        pages = _render_xml_to_pages(gt_xml, piece_pages_dir)
+
+        if pages:
+            # Update manifest with actual page count
+            info["pages"] = max(info.get("pages", 0), len(pages))
+            info["page_images_available"] = len(pages)
+            rendered += 1
+            print(f"    → {len(pages)} pages")
+        else:
+            print("    FAILED: no pages rendered", file=sys.stderr)
+            failed += 1
+
+    # Write updated manifest
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=False)
+
+    total_images = sum(p.get("page_images_available", 0) for p in manifest.values())
+    total_pages = sum(p.get("pages", 0) for p in manifest.values())
+    print("\nRendering complete:")
+    print(f"  {rendered} pieces rendered, {skipped} already complete, {failed} failed")
+    print(f"  {total_images}/{total_pages} total page images available")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Set up evaluation corpus")
+    parser.add_argument(
+        "roundtrip_dir",
+        nargs="?",
+        default=str(DEFAULT_ROUNDTRIP),
+        help="Path to roundtrip_results/ directory (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--render",
+        action="store_true",
+        help="Render missing page images via MuseScore + PyMuPDF",
+    )
+    args = parser.parse_args()
+
+    if args.render:
+        render_missing_pages()
+    else:
+        setup_corpus(Path(args.roundtrip_dir))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,21 @@
+# Project Profile
+
+## User
+- Working on OMR (Optical Music Recognition) accuracy improvement
+- Hands-on, prefers step-by-step collaboration over fully scripted automation
+- Has a 69-piece evaluation corpus for measuring recognition quality
+
+## Current Focus
+- Historical evaluation: comparing homr output across different git commits to measure improvement
+- Branch: `feature/historical-eval-20260314`
+
+## Architecture Decisions
+- Evaluation data lives OUTSIDE the repo at `/var/code/projects/chordquest/homr-eval/` to survive git operations
+- Git worktrees preferred over checkout-in-place for running different versions
+- No symlinks inside repo (vulnerable to git clean)
+
+## Gotchas
+- `git clean -fd` will destroy all untracked evaluation artifacts if stored inside repo
+- The old `run_historical.sh` is dangerous — don't use it, don't fix it
+- Page images are rendered from source XMLs via `evaluation/setup_corpus.py --render`
+- `.npy` cache files are model-version-specific — must clear between model boundaries

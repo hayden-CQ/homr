@@ -1,0 +1,32 @@
+"""Shared configuration for evaluation scripts.
+
+Evaluation artifacts (page images, run results, HTML reports) are stored in
+an external data directory to survive git checkout / clean operations.
+
+Resolution order for data directory:
+  1. Explicit path passed via --data-dir CLI argument
+  2. HOMR_EVAL_DIR environment variable
+  3. Default: ../homr-eval (sibling of the repository root)
+"""
+
+import os
+from pathlib import Path
+
+EVAL_DIR = Path(__file__).parent
+PROJECT_ROOT = EVAL_DIR.parent
+
+# Default: sibling directory of the repo
+_DEFAULT_DATA_DIR = PROJECT_ROOT.parent / "homr-eval"
+
+
+def get_data_dir(cli_override: str | None = None) -> Path:
+    """Resolve the external data directory for evaluation artifacts.
+
+    Contains: corpus/ (page images), runs/, spot/, PROGRESS.md, style.css
+    """
+    if cli_override:
+        return Path(cli_override).resolve()
+    env = os.environ.get("HOMR_EVAL_DIR", "").strip()
+    if env:
+        return Path(env).resolve()
+    return _DEFAULT_DATA_DIR.resolve()

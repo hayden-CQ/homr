@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""
+Render ground truth XMLs into per-page PNG images in corpus/.
+
+Requires: musescore in PATH, pymupdf installed.
+
+Usage:
+    python scripts/setup_corpus.py                # render all missing pages
+    python scripts/setup_corpus.py --piece piece-005  # render one piece
+    python scripts/setup_corpus.py --force        # re-render everything
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DATA_DIR = SCRIPT_DIR.parent
+
+
+def _render_xml_to_pages(xml_path: Path, output_dir: Path, dpi: int = 300) -> list[Path]:
+    """Render a MusicXML file to per-page PNGs via MuseScore + PyMuPDF."""
+    try:
+        import fitz  # noqa: F401
+    except ImportError:
+        print("ERROR: PyMuPDF not installed. Run: pip install pymupdf", file=sys.stderr)
+        sys.exit(1)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pdf_path = os.path.join(tmp, "score.pdf")
+
+        try:
+            result = subprocess.run(
+                ["musescore", "-o", pdf_path, str(xml_path)],
+                capture_output=True,
+                timeout=120,
+                check=False,
+            )
+            if result.returncode != 0 or not os.path.exists(pdf_path):
+                stderr_msg = result.stderr.decode(errors="replace")[:200]
+                print(f"    MuseScore failed (rc={result.returncode}): {stderr_msg}",
+                      file=sys.stderr)
+                return []
+        except FileNotFoundError:
+            print("ERROR: musescore not found in PATH. Install MuseScore.", file=sys.stderr)
+            sys.exit(1)
+        except subprocess.TimeoutExpired:
+            print(f"    MuseScore timed out on {xml_path.name}", file=sys.stderr)
+            return []
+
+        import fitz
+
+        doc = fitz.open(pdf_path)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        pages: list[Path] = []
+
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            zoom = dpi / 72.0
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat)
+
+            dest = output_dir / f"page-{page_num + 1:02d}.png"
+            pix.save(str(dest))
+            pages.append(dest)
+
+        doc.close()
+        return pages
+
+
+def render_corpus(piece_filter: str | None = None, force: bool = False) -> None:
+    """Render page images for all pieces (or one piece) from sources/ into corpus/."""
+    manifest_path = DATA_DIR / "manifest.json"
+    if not manifest_path.exists():
+        print(f"ERROR: {manifest_path} not found", file=sys.stderr)
+        sys.exit(1)
+
+    if not shutil.which("musescore"):
+        print("ERROR: musescore not found in PATH. Install MuseScore.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        import fitz  # noqa: F401
+    except ImportError:
+        print("ERROR: PyMuPDF not installed. Run: pip install pymupdf", file=sys.stderr)
+        sys.exit(1)
+
+    with open(manifest_path) as f:
+        manifest: dict[str, dict] = json.load(f)
+
+    sources_dir = DATA_DIR / "sources"
+    corpus_dir = DATA_DIR / "corpus"
+
+    rendered = 0
+    skipped = 0
+    failed = 0
+
+    items = [(piece_filter, manifest[piece_filter])] if piece_filter else sorted(manifest.items())
+
+    for piece_id, info in items:
+        piece_corpus_dir = corpus_dir / piece_id
+        existing = sorted(piece_corpus_dir.glob("page-*.png")) if piece_corpus_dir.is_dir() else []
+
+        if not force and existing:
+            skipped += 1
+            continue
+
+        gt_xml = sources_dir / f"{piece_id}.xml"
+        if not gt_xml.exists():
+            print(f"  SKIP {piece_id} ({info['name']}): no ground truth XML", file=sys.stderr)
+            failed += 1
+            continue
+
+        print(f"  {piece_id}: rendering {info['name']}...")
+        pages = _render_xml_to_pages(gt_xml, piece_corpus_dir)
+
+        if pages:
+            info["pages"] = max(info.get("pages", 0), len(pages))
+            info["page_images_available"] = len(pages)
+            rendered += 1
+            print(f"    -> {len(pages)} pages")
+        else:
+            print("    FAILED: no pages rendered", file=sys.stderr)
+            failed += 1
+
+    # Write updated manifest
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2, sort_keys=False)
+
+    total_images = sum(p.get("page_images_available", 0) for p in manifest.values())
+    total_pages = sum(p.get("pages", 0) for p in manifest.values())
+    print(f"\nRendering complete:")
+    print(f"  {rendered} pieces rendered, {skipped} already complete, {failed} failed")
+    print(f"  {total_images}/{total_pages} total page images available")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Render corpus page images from ground truth")
+    parser.add_argument("--piece", type=str, help="Render a single piece (e.g. piece-005)")
+    parser.add_argument("--force", action="store_true", help="Re-render even if images exist")
+    args = parser.parse_args()
+
+    if args.piece:
+        manifest_path = DATA_DIR / "manifest.json"
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        if args.piece not in manifest:
+            print(f"ERROR: '{args.piece}' not in manifest", file=sys.stderr)
+            sys.exit(1)
+
+    render_corpus(piece_filter=args.piece, force=args.force)
+
+
+if __name__ == "__main__":
+    main()

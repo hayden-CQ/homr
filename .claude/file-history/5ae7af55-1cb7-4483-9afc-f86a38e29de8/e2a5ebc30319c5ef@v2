@@ -1,0 +1,79 @@
+# Project Profile
+
+## User
+- Working on OMR (Optical Music Recognition) accuracy improvement
+- Hands-on, prefers step-by-step collaboration over fully scripted automation
+- Has a 69-piece evaluation corpus for measuring recognition quality
+- Prefers ergonomic CLI tooling (Makefile, ./run scripts) over raw commands
+- Knows the music pieces well — can spot wrong notes by inspection
+
+## Current Focus
+- Isolating cause of branch regression under correct v2 eval
+- Branch: `feature/bass-clef-extrapolation-20260317` at commit `53f1f40`
+- 24 changed files in homr/ from main (upstream merge + our changes)
+
+## Architecture Decisions
+- Evaluation data lives OUTSIDE the repo at `/related/homr-eval/` (also accessible via `/var/code/projects/chordquest/homr-eval/`)
+- Git worktrees preferred over checkout-in-place for running different versions
+- No symlinks inside repo (vulnerable to git clean)
+- Builds symlinked in `homr-eval/builds/` pointing to homr dir or worktrees
+
+## Key Technical Details
+- **StaffAnchor system**: Detects 5 parallel staff lines at known symbols (clefs, barlines, rests)
+- **`_try_create_anchor`**: Uses symbol bounding box height to estimate unit size → search window height
+- **Small bass clef detections** (h≈62) create narrow search windows that miss the 5th staff line
+- **Fallback chain in `find_staff_anchors`**: adjacent offsets → extrapolation (4→5 lines) → wide search box → rejection
+- **`HOMR_DIAGNOSE_STAFFS=1`** env var enables diagnostic logging in staff_detection.py
+- **`HOMR_VERBOSE=1`** enables pipeline tracing (TrOmr token counts, post-processing stats)
+- **`HOMR_DISABLE_GEOMETRIC_CORRECTION=1`** disables geometric pitch correction
+- **`HOMR_PICKUP_DEBUG=/path/to/file.log`** logs pickup detection decisions to file (stderr captured by eval)
+- **ONNX models**: Run 286 (old), Run 331 (current, on GitHub releases), Run 287 (Marko's, fp16 only on HuggingFace)
+
+## TrOmr Pipeline (critical for debugging)
+- Each grand staff system → cropped image → TrOmr model → token sequence (EncodedSymbol list)
+- **Measures**: determined by `barline` tokens in TrOmr output (NOT image processing barlines)
+- **Staff assignment**: `position` field ("upper"=staff 1, "lower"=staff 2) from decoder
+- **Pitch**: from pitch token; geometric correction only modifies treble (skips position=="lower")
+- **Crop boundaries**: determined by staff line extents from `find_raw_staffs_by_connecting_line_fragments`
+- If crop overlaps adjacent systems → TrOmr sees extra content → extra measures generated
+- **SymbolChord mixes positions**: A single chord can contain both upper and lower staff symbols — per-staff analysis at chord level is impossible
+- **`symbol.coordinates`** on debug output images come from **cross-attention weights**, not notehead detection
+- The red circles on `_output.jpg` show where decoder attended when generating each token
+
+## TrOmr Known Biases
+- Misplaces first barline in 3/4 time (generates barline after 1 beat instead of 3)
+- Generates A2-E3-A3 bass template pattern at system starts regardless of actual content
+- Drops beats from first measure, making it look like a pickup
+- **Bass hallucination**: Decoder generates phantom bass notes/rests for grand staff input even when bass staff is empty (confirmed on piece-063, seen on others). Purely autoregressive generation bias — notehead detector is accurate.
+
+## Staff Construction Changes (main-331 → our branch)
+- `_merge_colinear_connected_lines`: merges staff line fragments at same y-position
+- `_find_closest_connected_line`: fallback when subset matching fails
+- These can extend staff lines too far, causing system crop overlap
+- 1082 lines changed in staff_detection.py between main and our branch
+
+## Eval Infrastructure
+- **v2 eval** (current): flat-sequence SER using SequenceMatcher opcodes + structural metrics
+- **v1 eval** (deprecated): measure-number-join that cascaded pickup numbering offsets into catastrophic SER
+- Eval scripts in `/related/homr-eval/scripts/` on branch `feature/flat-ser-comparison-20260318`
+- Eval script: `run_evaluation.py` — uses `capture_output=True` (swallows stderr)
+- Only `HOMR_DIAGNOSE_STAFFS` env var passed through to subprocess
+- Caching by commit hash: same commit = cached results reused. Must commit before re-running eval.
+- `./run eval <build>` — full 69-piece evaluation
+- `./run debug <piece#> <build>` — single-piece debug runs
+- `./run rediagnose <run>` — re-run v2 diagnosis on existing run's MusicXML files
+- `./run compare <run-a> <run-b>` — side-by-side comparison with structural metrics
+- `./run compare-piece <piece#> <run-a> <run-b>` — deep-dive single piece
+- `./run html` — regenerates ALL run HTML pages (not just index)
+
+## Gotchas
+- `git clean -fd` will destroy all untracked evaluation artifacts if stored inside repo
+- The old `run_historical.sh` is dangerous — don't use it, don't fix it
+- `.npy` cache files are model-version-specific — must clear between model boundaries
+- TrOmr inference can OOM on some pages (exit 137) — in container only, not on host
+- `/related/` paths are writable, not read-only
+- The eval script uses `poetry run homr` from the homr dir — runs source code directly
+- fp16 ONNX models need recursive subgraph conversion for CPU inference (nested If/Loop nodes)
+- Debug logging must use file paths (not stderr) because eval captures subprocess output
+- Pickup detection only changes measure numbering, not actual notes — irrelevant under v2 eval
+- Branch diff from main is 24 files in homr/ (upstream merge), not just 3 as previously assumed
