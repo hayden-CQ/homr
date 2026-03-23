@@ -1,4 +1,6 @@
+import json
 import math
+import os
 
 import cv2
 import numpy as np
@@ -14,6 +16,50 @@ from homr.staff_regions import StaffRegions
 from homr.transformer.configs import Config, default_config
 from homr.transformer.vocabulary import EncodedSymbol, remove_duplicated_symbols
 from homr.type_definitions import NDArray
+
+# Token cache: save raw TrOmr output to skip inference on replay.
+# HOMR_CACHE_TOKENS=<dir>  — write raw tokens after inference
+# HOMR_REPLAY_TOKENS=<dir> — read cached tokens instead of running inference
+_cache_tokens_dir: str | None = os.environ.get("HOMR_CACHE_TOKENS")
+_replay_tokens_dir: str | None = os.environ.get("HOMR_REPLAY_TOKENS")
+
+
+def _token_cache_path(cache_dir: str, image_path: str, staff_index: int) -> str:
+    """Build a cache file path from image name and staff index."""
+    base = os.path.splitext(os.path.basename(image_path))[0]
+    return os.path.join(cache_dir, f"{base}_staff{staff_index}.json")
+
+
+def _save_tokens(path: str, tokens: list[EncodedSymbol]) -> None:
+    """Serialize raw TrOmr tokens to JSON."""
+    data = []
+    for t in tokens:
+        entry: dict = {"rhythm": t.rhythm, "pitch": t.pitch, "lift": t.lift,
+                       "articulation": t.articulation, "position": t.position}
+        if t.coordinates is not None:
+            entry["coordinates"] = list(t.coordinates)
+        data.append(entry)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f)
+
+
+def _load_tokens(path: str) -> list[EncodedSymbol]:
+    """Deserialize raw TrOmr tokens from JSON."""
+    with open(path) as f:
+        data = json.load(f)
+    tokens = []
+    for entry in data:
+        coords = tuple(entry["coordinates"]) if "coordinates" in entry else None
+        tokens.append(EncodedSymbol(
+            rhythm=entry["rhythm"],
+            pitch=entry["pitch"],
+            lift=entry["lift"],
+            articulation=entry["articulation"],
+            position=entry["position"],
+            coordinates=coords,
+        ))
+    return tokens
 
 
 def _have_all_the_same_number_of_staffs(staffs: list[MultiStaff]) -> bool:
@@ -237,8 +283,24 @@ def parse_staff_image(
     staff_image, transformed_staff = prepare_staff_image(
         debug, index, staff, image, regions=regions
     )
-    eprint("Running TrOmr inference on staff image", index)
-    result = parse_staff_tromr(staff_image=staff_image, staff=transformed_staff, config=config)
+    # Token cache: replay cached tokens or run inference
+    if _replay_tokens_dir:
+        cache_path = _token_cache_path(_replay_tokens_dir, debug.filename, index)
+        if os.path.exists(cache_path):
+            eprint("Replaying cached tokens for staff", index)
+            result = _load_tokens(cache_path)
+        else:
+            eprint("Cache miss for staff", index, "- running inference")
+            result = parse_staff_tromr(staff_image=staff_image, staff=transformed_staff, config=config)
+    else:
+        eprint("Running TrOmr inference on staff image", index)
+        result = parse_staff_tromr(staff_image=staff_image, staff=transformed_staff, config=config)
+
+    if _cache_tokens_dir:
+        cache_path = _token_cache_path(_cache_tokens_dir, debug.filename, index)
+        _save_tokens(cache_path, result)
+        eprint("Cached tokens for staff", index, "→", cache_path)
+
     if debug.debug:
         result_image = staff_image.copy()
         for i, symbol in enumerate(result):
