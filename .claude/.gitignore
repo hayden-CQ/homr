@@ -1,0 +1,8 @@
+# Ignore everything
+*
+
+# But keep the .gitignore itself (otherwise it can be awkward)
+!.gitignore
+
+# Allow specific files at repo root
+!profile.md

@@ -53,3 +53,7 @@ _build/
 /runs
 /training/architecture/transformer/*/
 *.tokens
+# Agent session files
+.forgent/sessions/
+.session_id
+.container_id

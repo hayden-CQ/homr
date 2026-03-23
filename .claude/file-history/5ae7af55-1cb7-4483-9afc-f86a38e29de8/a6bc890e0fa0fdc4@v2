@@ -1,6 +1,0 @@
-builds/
-runs/
-spot/
-logs/
-.venv/
-__pycache__/
